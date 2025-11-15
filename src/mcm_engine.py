@@ -187,7 +187,7 @@ class MCMEngine:
             tool_count=len(tools),
             complexity_score=self.calculate_complexity(tools),
             context_cost_estimate=self.estimate_context_cost(tools),
-            dependencies=package_json.get("dependencies", {}).keys() if package_json else [],
+            dependencies=list(package_json.get("dependencies", {}).keys()) if package_json else [],
             credentials_needed=self.detect_credentials(tools),
             discovered_at=datetime.utcnow().isoformat() + "Z",
             format=self.determine_optimal_format(tools)
