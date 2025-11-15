@@ -410,7 +410,7 @@ MIT License - see [LICENSE](LICENSE) file for details.
 - 📖 **Documentation:** Type `/mcm help` in Claude Code
 - 🐛 **Bug Reports:** [GitHub Issues](https://github.com/Lucface/mcm-context-manager/issues)
 - 💬 **Questions:** [GitHub Discussions](https://github.com/Lucface/mcm-context-manager/discussions)
-- 📧 **Email:** your.email@example.com
+- 📧 **Email:** REDACTED
 
 ---
 
