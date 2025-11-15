@@ -46,9 +46,9 @@ Result: Run out of context after 8-10 tasks
 - 💸 Paying for tokens you don't use (waste)
 - 🔄 Starting fresh conversations constantly (lost context)
 
-**There has to be a better way...**
 
-## ✨ The Solution
+
+## ✨ There has to be a better way...
 
 **MCM (MCP Context Manager)** solves this completely and automatically.
 
