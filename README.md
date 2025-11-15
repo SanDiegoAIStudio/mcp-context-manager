@@ -100,7 +100,7 @@ Result: Handle 30-40 tasks per conversation
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/mcm-context-manager.git
+git clone https://github.com/Lucface/mcm-context-manager.git
 cd mcm-context-manager
 
 # Run installer
@@ -231,7 +231,7 @@ All commands work in **Claude Code** by typing `/mcm <command>`:
 
 1. **Clone repository:**
    ```bash
-   git clone https://github.com/yourusername/mcm-context-manager.git
+   git clone https://github.com/Lucface/mcm-context-manager.git
    cd mcm-context-manager
    ```
 
@@ -392,8 +392,8 @@ MIT License - see [LICENSE](LICENSE) file for details.
 - **Documentation:** Type `/mcm help` in Claude Code
 - **Setup Guide:** [docs/SETUP_GUIDE.md](docs/SETUP_GUIDE.md)
 - **Architecture:** [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
-- **Issues:** [GitHub Issues](https://github.com/yourusername/mcm-context-manager/issues)
-- **Discussions:** [GitHub Discussions](https://github.com/yourusername/mcm-context-manager/discussions)
+- **Issues:** [GitHub Issues](https://github.com/Lucface/mcm-context-manager/issues)
+- **Discussions:** [GitHub Discussions](https://github.com/Lucface/mcm-context-manager/discussions)
 
 ---
 
@@ -408,8 +408,8 @@ MIT License - see [LICENSE](LICENSE) file for details.
 ## 📞 Support
 
 - 📖 **Documentation:** Type `/mcm help` in Claude Code
-- 🐛 **Bug Reports:** [GitHub Issues](https://github.com/yourusername/mcm-context-manager/issues)
-- 💬 **Questions:** [GitHub Discussions](https://github.com/yourusername/mcm-context-manager/discussions)
+- 🐛 **Bug Reports:** [GitHub Issues](https://github.com/Lucface/mcm-context-manager/issues)
+- 💬 **Questions:** [GitHub Discussions](https://github.com/Lucface/mcm-context-manager/discussions)
 - 📧 **Email:** your.email@example.com
 
 ---
