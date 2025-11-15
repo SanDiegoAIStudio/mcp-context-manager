@@ -1,0 +1,40 @@
+# Example MCP List for /mcm discover
+# Copy and paste any of these formats - MCM understands them all!
+
+# ===== SIMPLE NAMES =====
+filesystem
+github
+postgres
+slack
+playwright
+eslint
+
+# ===== NPM PACKAGES (Official) =====
+@modelcontextprotocol/server-filesystem
+@modelcontextprotocol/server-postgres
+@modelcontextprotocol/server-slack
+
+# ===== GITHUB URLs =====
+https://github.com/modelcontextprotocol/servers
+https://github.com/anthropics/anthropic-quickstarts
+
+# ===== MIXED FORMAT (All at once!) =====
+filesystem
+@modelcontextprotocol/server-postgres
+https://github.com/user/custom-mcp-server
+playwright
+"the GitHub integration MCP"
+
+# ===== TIPS =====
+# - One MCP per line
+# - Any format works (names, URLs, packages, descriptions)
+# - Comments (lines starting with #) are ignored
+# - Blank lines are ignored
+# - MCM figures out what you mean automatically
+
+# Example usage:
+# 1. In Claude Code, type: /mcm discover
+# 2. Choose option 1 (paste a list)
+# 3. Copy and paste MCPs from above
+# 4. Press Enter twice
+# 5. Wait for discovery (2-5 minutes)
