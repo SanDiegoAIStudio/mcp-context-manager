@@ -18,7 +18,7 @@ import hashlib
 
 # Configuration
 MCM_HOME = Path(os.getenv("MCM_HOME", Path.home() / ".mcm"))
-EXA_API_KEY = os.getenv("EXA_API_KEY", "91965e99-9c35-45c3-995f-a130c508b687")
+EXA_API_KEY = os.getenv("EXA_API_KEY", "")
 
 @dataclass
 class MCPMetadata:

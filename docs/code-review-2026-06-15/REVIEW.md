@@ -24,7 +24,7 @@ Severity counts are deduplicated (the raw review emitted 6 separate Critical ent
 
 **Hardcoded API key exposed in source code**
 `src/mcm_engine.py:21`
-`EXA_API_KEY` is hardcoded with a default fallback value (`91965e99-9c35-45c3-995f-a130c508b687`). A real, active key committed to the repo is exposed in source and git history; anyone with repo access can make requests on the legitimate account. Reported independently by 6 reviewers (plus 2 lower-severity restatements) — treat as the headline issue.
+`EXA_API_KEY` is hardcoded with a default fallback value (`REDACTED`). A real, active key committed to the repo is exposed in source and git history; anyone with repo access can make requests on the legitimate account. Reported independently by 6 reviewers (plus 2 lower-severity restatements) — treat as the headline issue.
 *Fix:* Change line 21 to `EXA_API_KEY = os.getenv("EXA_API_KEY", "")`. Fail safely with a clear error/warning when the key is missing rather than falling back to a leaked credential. **Rotate the key immediately** — assume it is compromised since it is in history.
 
 **Bare `except:` clauses catch all exceptions including `SystemExit`/`KeyboardInterrupt`**
