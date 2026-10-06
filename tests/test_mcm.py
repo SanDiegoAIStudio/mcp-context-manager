@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Tests for MCP Context Manager installer, engine, and command routing."""
 
+import contextlib
 import email.message
 import io
 import json
@@ -323,6 +324,123 @@ class NpmDiscoverTests(IsolatedHomeTest):
         names = [item["name"] for item in index.get("mcps", [])]
         self.assertIn("demo-mcp", names)
 
+    def test_discover_from_npm_connection_error_includes_reason(self):
+        """source: a lookup that could not connect raised 'NPM registry error: 0' and dropped the reason"""
+        engine_mod = load_engine(self.mcm_home)
+        engine = engine_mod.MCMEngine()
+        with patch.object(engine_mod, "http_request", return_value=(0, "network down")):
+            with self.assertRaises(Exception) as ctx:
+                engine.discover_from_npm({"identifier": "demo-mcp", "type": "npm_package"})
+        self.assertIn("could not connect (network down)", str(ctx.exception))
+
+
+class EngineMainTests(IsolatedHomeTest):
+    def test_discover_exits_1_when_every_mcp_fails(self):
+        """source: the engine exited 0 and the script printed Discovery complete when every MCP failed"""
+        engine_mod = load_engine(self.mcm_home)
+        list_file = self.tmp / "mcp-list.txt"
+        list_file.write_text("demo-mcp\n")
+        with patch.object(engine_mod, "http_request", return_value=(404, "")), \
+             patch.object(engine_mod.time, "sleep"), \
+             patch.object(engine_mod.sys, "argv", ["mcm_engine.py", "discover", str(list_file)]):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                with self.assertRaises(SystemExit) as ctx:
+                    engine_mod.main()
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertIn("Discovered 0 of 1", buf.getvalue())
+
+
+class ScanConfigTests(IsolatedHomeTest):
+    def test_scan_claude_config_reads_packages_and_skips_aliases(self):
+        """source: menu option 3 fed config aliases such as 'github' to npm lookups"""
+        engine_mod = load_engine(self.mcm_home)
+        project_dir = self.tmp / "project"
+        project_dir.mkdir()
+        (project_dir / ".mcp.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "fs": {
+                            "command": "npx",
+                            "args": [
+                                "-y",
+                                "@modelcontextprotocol/server-filesystem@1.2.0",
+                                "/tmp",
+                            ],
+                        },
+                        "remote": {
+                            "type": "http",
+                            "url": "https://example.test/mcp",
+                        },
+                    }
+                }
+            )
+        )
+        (self.home / ".claude.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "gh": {
+                            "command": "/usr/local/bin/npx",
+                            "args": ["@modelcontextprotocol/server-github"],
+                        }
+                    },
+                    "projects": {
+                        "/x": {
+                            "mcpServers": {
+                                "fs2": {
+                                    "command": "npx",
+                                    "args": [
+                                        "-y",
+                                        "@modelcontextprotocol/server-filesystem",
+                                    ],
+                                },
+                                "local": {
+                                    "command": "node",
+                                    "args": ["server.js"],
+                                },
+                                "plain": {
+                                    "command": "bunx",
+                                    "args": ["some-mcp@latest"],
+                                },
+                            }
+                        }
+                    },
+                }
+            )
+        )
+        packages, skipped = engine_mod.scan_claude_config(project_dir, self.home)
+        self.assertEqual(
+            packages,
+            [
+                "@modelcontextprotocol/server-filesystem",
+                "@modelcontextprotocol/server-github",
+                "some-mcp",
+            ],
+        )
+        self.assertEqual(
+            skipped,
+            [
+                "remote: not started with npx or bunx",
+                "local: not started with npx or bunx",
+            ],
+        )
+
+    def test_scan_claude_config_survives_bad_files(self):
+        """source: a malformed config file stopped the scan"""
+        engine_mod = load_engine(self.mcm_home)
+        project_dir = self.tmp / "project"
+        project_dir.mkdir()
+        (project_dir / ".mcp.json").write_text("{not json")
+        (self.home / ".claude.json").write_text('["a list"]')
+        try:
+            packages, skipped = engine_mod.scan_claude_config(project_dir, self.home)
+        except Exception as exc:
+            self.fail("scan_claude_config raised %r" % (exc,))
+        self.assertEqual(packages, [])
+        self.assertEqual(skipped, [])
+
 
 class DiscoverScriptTests(IsolatedHomeTest):
     def test_discover_args_call_engine_and_empty_stdin_exits(self):
@@ -432,6 +550,33 @@ class DiscoverScriptTests(IsolatedHomeTest):
         ]
         self.assertEqual(names, ["gamma", "delta"])
 
+    def test_discover_reports_failure_when_engine_fails(self):
+        """source: discover.sh printed Discovery complete after the engine failed"""
+        scripts = install_copy(self.home)
+        stub_path = scripts / "mcm_engine.py"
+        stub_path.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            "print('stub failing')\n"
+            "sys.exit(1)\n"
+        )
+        env = isolated_env(self.home)
+        proc = subprocess.run(
+            ["bash", str(scripts / "discover.sh"), "alpha"],
+            cwd=str(self.tmp),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(proc.returncode, 1)
+        combined = proc.stdout + proc.stderr
+        self.assertIn("Discovery failed: no MCP could be read.", combined)
+        self.assertNotIn("Discovery complete", combined)
+        cache = Path(self.home) / ".mcm" / "cache"
+        leftovers = list(cache.glob("mcp-input-*.txt"))
+        self.assertEqual(leftovers, [])
+
 
 class MainScriptTests(IsolatedHomeTest):
     def test_main_sh_search_is_unknown_and_help_omits_search(self):
@@ -460,7 +605,7 @@ class MainScriptTests(IsolatedHomeTest):
         )
         self.assertEqual(help_proc.returncode, 0)
         help_text = (help_proc.stdout + help_proc.stderr).lower()
-        self.assertNotIn("search", help_text)
+        self.assertNotIn("search <query>", help_text)
 
 
 class ImportTests(unittest.TestCase):

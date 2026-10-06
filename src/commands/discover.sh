@@ -63,48 +63,7 @@ else
             cp "$file_path" "$MCP_INPUT_FILE"
             ;;
         3)
-            python3 -c '
-import json
-from pathlib import Path
-
-names = []
-seen = set()
-
-def add_servers(obj):
-    if not isinstance(obj, dict):
-        return
-    servers = obj.get("mcpServers") or {}
-    if not isinstance(servers, dict):
-        return
-    for name in servers:
-        if name not in seen:
-            seen.add(name)
-            names.append(name)
-
-mcp_json = Path("./.mcp.json")
-if mcp_json.is_file():
-    try:
-        with open(mcp_json) as handle:
-            add_servers(json.load(handle))
-    except (OSError, json.JSONDecodeError, TypeError, ValueError):
-        pass
-
-claude_json = Path.home() / ".claude.json"
-if claude_json.is_file():
-    try:
-        with open(claude_json) as handle:
-            data = json.load(handle)
-        add_servers(data)
-        projects = data.get("projects") or {}
-        if isinstance(projects, dict):
-            for entry in projects.values():
-                add_servers(entry)
-    except (OSError, json.JSONDecodeError, TypeError, ValueError):
-        pass
-
-for name in names:
-    print(name)
-' > "$MCP_INPUT_FILE"
+            python3 "$ENGINE" scan-config > "$MCP_INPUT_FILE"
 
             if [[ ! -s "$MCP_INPUT_FILE" ]]; then
                 echo "No MCP servers found in ./.mcp.json or ~/.claude.json"
@@ -148,16 +107,19 @@ echo -e "${BOLD}🚀 Starting MCP discovery...${NC}"
 echo ""
 
 # Run discovery
-python3 "$ENGINE" discover "$MCP_INPUT_FILE"
+if python3 "$ENGINE" discover "$MCP_INPUT_FILE"; then
+    rm -f "$MCP_INPUT_FILE"
 
-# Clean up
-rm -f "$MCP_INPUT_FILE"
-
-echo ""
-echo -e "${GREEN}✅ Discovery complete!${NC}"
-echo ""
-echo "Next steps:"
-echo "1. Review: cat $MCM_HOME/registry/index.json"
-echo "2. Configure credentials: edit $MCM_HOME/config/credentials.env"
-echo "3. Validate: mcm validate"
-echo ""
+    echo ""
+    echo -e "${GREEN}✅ Discovery complete!${NC}"
+    echo ""
+    echo "Next steps:"
+    echo "1. Review: cat $MCM_HOME/registry/index.json"
+    echo "2. Configure credentials: edit $MCM_HOME/config/credentials.env"
+    echo "3. Validate: mcm validate"
+    echo ""
+else
+    rm -f "$MCP_INPUT_FILE"
+    echo "Discovery failed: no MCP could be read. See the errors above."
+    exit 1
+fi
