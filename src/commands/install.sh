@@ -29,11 +29,8 @@ if ! command -v git &> /dev/null; then
 fi
 echo "✓ Git"
 
-# Install Python dependencies
 echo ""
-echo "Installing Python dependencies..."
-python3 -m pip install --user requests >/dev/null 2>&1 || true
-echo "✓ Python packages"
+echo "✓ Python standard library only, nothing to install"
 
 # Create MCM directories
 echo ""
