@@ -189,6 +189,21 @@ class InstallScriptTests(IsolatedHomeTest):
         recorded = record.read_text() if record.exists() else ""
         self.assertNotIn("pip", recorded)
 
+    def test_install_prints_no_raw_color_codes(self):
+        """source: the installer's Next steps printed raw color codes"""
+        env = isolated_env(self.home)
+        proc = subprocess.run(
+            ["bash", str(REPO_ROOT / "install.sh")],
+            cwd=str(REPO_ROOT),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        combined = proc.stdout + proc.stderr
+        self.assertNotIn("\\033", combined)
+        self.assertIn("Next steps:", combined)
+
 
 class ParseMcpInputTests(IsolatedHomeTest):
     def test_parse_mcp_input_skips_comments_and_classifies_names(self):
@@ -606,6 +621,22 @@ class MainScriptTests(IsolatedHomeTest):
         self.assertEqual(help_proc.returncode, 0)
         help_text = (help_proc.stdout + help_proc.stderr).lower()
         self.assertNotIn("search <query>", help_text)
+
+    def test_help_prints_no_raw_color_codes(self):
+        """source: mcm help printed raw color codes such as \\033[1m"""
+        main = SRC_DIR / "commands" / "main.sh"
+        env = isolated_env(self.home)
+        proc = subprocess.run(
+            ["bash", str(main), "help"],
+            cwd=str(self.tmp),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        combined = proc.stdout + proc.stderr
+        self.assertNotIn("\\033", combined)
+        self.assertIn("Commands:", combined)
 
 
 class ImportTests(unittest.TestCase):
