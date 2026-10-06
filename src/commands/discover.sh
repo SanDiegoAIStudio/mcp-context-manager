@@ -10,11 +10,11 @@ MCM_HOME="${MCM_HOME:-$HOME/.mcm}"
 ENGINE="$SCRIPT_DIR/mcm_engine.py"
 
 # Colors
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-NC='\033[0m'
-BOLD='\033[1m'
+GREEN=$'\033[0;32m'
+YELLOW=$'\033[1;33m'
+CYAN=$'\033[0;36m'
+NC=$'\033[0m'
+BOLD=$'\033[1m'
 
 echo -e "${CYAN}🔍 MCP Context Manager - Discovery${NC}\n"
 
