@@ -129,6 +129,12 @@ This moves MCP reasoning from **prompt-time → offline-time**.
 
 ---
 
+## Known limits
+
+- Tool counts are a guess. The engine searches a few files in the package's GitHub repository for tool registrations, so a count can be wrong or zero, and a package whose repository holds many servers is saved under the repository's name. On 2026-10-06, `@modelcontextprotocol/server-filesystem` was saved as `servers` with 1 tool.
+
+---
+
 ## ⚠️ Project Status
 
 **Early-stage / experimental**
