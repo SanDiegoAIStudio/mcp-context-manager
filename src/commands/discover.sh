@@ -30,63 +30,118 @@ if [[ ! -d "$MCM_HOME" ]]; then
     mkdir -p "$MCM_HOME"/{config,registry,converted,embeddings,analytics,cache,backups,logs}
 fi
 
-echo "How would you like to provide your MCPs?"
-echo ""
-echo "1. Paste a list (names, URLs, or mixed)"
-echo "2. Point to a file"
-echo "3. Scan my Claude config automatically"
-echo ""
-read -p "Choose 1-3: " choice
-
+mkdir -p "$MCM_HOME/cache"
 MCP_INPUT_FILE="$MCM_HOME/cache/mcp-input-$$.txt"
 
-case $choice in
-    1)
-        echo ""
-        echo "📋 Paste your MCP list below (press Ctrl+D when done):"
-        echo ""
-        cat > "$MCP_INPUT_FILE"
-        ;;
-    2)
-        echo ""
-        read -p "Path to file: " file_path
-        if [[ ! -f "$file_path" ]]; then
-            echo "Error: File not found: $file_path"
-            exit 1
-        fi
-        cp "$file_path" "$MCP_INPUT_FILE"
-        ;;
-    3)
-        CLAUDE_CONFIG="$HOME/.config/claude/mcp_config.json"
-        if [[ ! -f "$CLAUDE_CONFIG" ]]; then
-            echo "Error: Claude config not found at $CLAUDE_CONFIG"
-            exit 1
-        fi
+if [[ $# -gt 0 ]]; then
+    printf '%s\n' "$@" > "$MCP_INPUT_FILE"
+elif [ ! -t 0 ]; then
+    cat > "$MCP_INPUT_FILE"
+else
+    echo "How would you like to provide your MCPs?"
+    echo ""
+    echo "1. Paste a list (names, URLs, or mixed)"
+    echo "2. Point to a file"
+    echo "3. Scan my Claude config automatically"
+    echo ""
+    read -p "Choose 1-3: " choice
 
-        echo "Scanning $CLAUDE_CONFIG..."
-        # Extract MCP names from config
-        python3 -c "
+    case $choice in
+        1)
+            echo ""
+            echo "📋 Paste your MCP list below (press Ctrl+D when done):"
+            echo ""
+            cat > "$MCP_INPUT_FILE"
+            ;;
+        2)
+            echo ""
+            read -p "Path to file: " file_path
+            if [[ ! -f "$file_path" ]]; then
+                echo "Error: File not found: $file_path"
+                exit 1
+            fi
+            cp "$file_path" "$MCP_INPUT_FILE"
+            ;;
+        3)
+            python3 -c '
 import json
-with open('$CLAUDE_CONFIG') as f:
-    config = json.load(f)
-mcps = config.get('mcpServers', {}).keys()
-for mcp in mcps:
-    print(mcp)
-" > "$MCP_INPUT_FILE"
+from pathlib import Path
 
-        MCP_COUNT=$(wc -l < "$MCP_INPUT_FILE" | tr -d ' ')
-        echo "Found $MCP_COUNT MCPs. Proceed with discovery? (y/n)"
-        read -p "> " proceed
-        if [[ "$proceed" != "y" ]]; then
-            echo "Cancelled."
-            exit 0
-        fi
-        ;;
-    *)
-        echo "Invalid choice"
-        exit 1
-        ;;
-esac
+names = []
+seen = set()
+
+def add_servers(obj):
+    if not isinstance(obj, dict):
+        return
+    servers = obj.get("mcpServers") or {}
+    if not isinstance(servers, dict):
+        return
+    for name in servers:
+        if name not in seen:
+            seen.add(name)
+            names.append(name)
+
+mcp_json = Path("./.mcp.json")
+if mcp_json.is_file():
+    try:
+        with open(mcp_json) as handle:
+            add_servers(json.load(handle))
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        pass
+
+claude_json = Path.home() / ".claude.json"
+if claude_json.is_file():
+    try:
+        with open(claude_json) as handle:
+            data = json.load(handle)
+        add_servers(data)
+        projects = data.get("projects") or {}
+        if isinstance(projects, dict):
+            for entry in projects.values():
+                add_servers(entry)
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        pass
+
+for name in names:
+    print(name)
+' > "$MCP_INPUT_FILE"
+
+            if [[ ! -s "$MCP_INPUT_FILE" ]]; then
+                echo "No MCP servers found in ./.mcp.json or ~/.claude.json"
+                rm -f "$MCP_INPUT_FILE"
+                exit 1
+            fi
+
+            MCP_COUNT=$(wc -l < "$MCP_INPUT_FILE" | tr -d ' ')
+            echo "Found $MCP_COUNT MCPs. Proceed with discovery? (y/n)"
+            read -p "> " proceed
+            if [[ "$proceed" != "y" ]]; then
+                echo "Cancelled."
+                exit 0
+            fi
+            ;;
+        *)
+            echo "Invalid choice"
+            exit 1
+            ;;
+    esac
+fi
+
+has_name=0
+while IFS= read -r line || [[ -n "${line:-}" ]]; do
+    trimmed="${line#"${line%%[![:space:]]*}"}"
+    if [[ -z "$trimmed" || "$trimmed" == \#* ]]; then
+        continue
+    fi
+    has_name=1
+    break
+done < "$MCP_INPUT_FILE"
+
+if [[ "$has_name" -eq 0 ]]; then
+    echo "No MCP names given. Example: mcm discover @modelcontextprotocol/server-filesystem"
+    rm -f "$MCP_INPUT_FILE"
+    exit 1
+fi
 
 echo ""
 echo -e "${BOLD}🚀 Starting MCP discovery...${NC}"
