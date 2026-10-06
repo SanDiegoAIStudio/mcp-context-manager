@@ -70,6 +70,12 @@ def http_request(
         return (0, str(exc))
 
 
+def http_error(label: str, status: int, text: str) -> Exception:
+    if status == 0:
+        return Exception(f"{label}: could not connect ({text})")
+    return Exception(f"{label}: {status}")
+
+
 @dataclass
 class MCPMetadata:
     """Metadata about an MCP"""
@@ -210,7 +216,7 @@ class MCMEngine:
 
         status, text = http_request("GET", api_url, headers=headers)
         if status != 200:
-            raise Exception(f"GitHub API error: {status}")
+            raise http_error("GitHub API error", status, text)
 
         repo_data = json.loads(text)
 
@@ -255,7 +261,7 @@ class MCMEngine:
 
         status, text = http_request("GET", npm_url)
         if status != 200:
-            raise Exception(f"NPM registry error: {status}")
+            raise http_error("NPM registry error", status, text)
 
         npm_data = json.loads(text)
         latest_version = npm_data["dist-tags"]["latest"]
@@ -315,7 +321,7 @@ class MCMEngine:
             "POST", "https://api.exa.ai/search", headers=headers, json_body=data
         )
         if status != 200:
-            raise Exception(f"Exa.ai API error: {status}")
+            raise http_error("Exa.ai API error", status, text)
 
         results = json.loads(text).get("results", [])
 
@@ -453,6 +459,80 @@ class MCMEngine:
         with open(index_file, "w") as f:
             json.dump(index, f, indent=2)
 
+
+def scan_claude_config(project_dir: Path, home: Path) -> Tuple[List[str], List[str]]:
+    packages = []  # type: List[str]
+    skipped = []  # type: List[str]
+
+    def strip_version(package):
+        if package.startswith("@"):
+            idx = package.find("@", 1)
+            if idx != -1:
+                return package[:idx]
+            return package
+        idx = package.find("@")
+        if idx != -1:
+            return package[:idx]
+        return package
+
+    def npx_package(entry):
+        if not isinstance(entry, dict):
+            return None
+        command = entry.get("command")
+        if not isinstance(command, str):
+            return None
+        base = os.path.basename(command)
+        if base not in ("npx", "bunx"):
+            return None
+        args = entry.get("args")
+        if not isinstance(args, list):
+            return None
+        for arg in args:
+            if isinstance(arg, str) and not arg.startswith("-"):
+                return strip_version(arg)
+        return None
+
+    def ingest(obj):
+        if not isinstance(obj, dict):
+            return
+        servers = obj.get("mcpServers")
+        if not isinstance(servers, dict):
+            return
+        for name, entry in servers.items():
+            package = npx_package(entry)
+            if package is not None:
+                if package not in packages:
+                    packages.append(package)
+            else:
+                skip_entry = f"{name}: not started with npx or bunx"
+                if skip_entry not in skipped:
+                    skipped.append(skip_entry)
+
+    def load_object(path):
+        try:
+            with open(path) as handle:
+                data = json.load(handle)
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            return None
+        if isinstance(data, dict):
+            return data
+        return None
+
+    project_cfg = load_object(project_dir / ".mcp.json")
+    if project_cfg is not None:
+        ingest(project_cfg)
+
+    home_cfg = load_object(home / ".claude.json")
+    if home_cfg is not None:
+        ingest(home_cfg)
+        projects = home_cfg.get("projects")
+        if isinstance(projects, dict):
+            for value in projects.values():
+                ingest(value)
+
+    return (packages, skipped)
+
+
 def main():
     """Main entry point"""
     engine = MCMEngine()
@@ -475,6 +555,7 @@ def main():
         mcps = engine.parse_mcp_input(mcp_text)
         print(f"Found {len(mcps)} MCPs to discover\n")
 
+        ok = 0
         for i, mcp_info in enumerate(mcps, 1):
             print(f"[{i}/{len(mcps)}] Discovering {mcp_info['identifier']}...")
             metadata = engine.discover_mcp(mcp_info)
@@ -482,10 +563,22 @@ def main():
             if metadata:
                 engine.save_metadata(metadata)
                 print(f"  ✓ {metadata.name}: {metadata.tool_count} tools, format: {metadata.format}")
+                ok += 1
             else:
                 print(f"  ✗ Failed to discover")
 
             time.sleep(1)  # Rate limiting
+
+        print(f"Discovered {ok} of {len(mcps)}")
+        if len(mcps) > 0 and ok == 0:
+            sys.exit(1)
+
+    elif command == "scan-config":
+        packages, skipped = scan_claude_config(Path.cwd(), Path.home())
+        for package in packages:
+            print(package)
+        for entry in skipped:
+            print(f"Skipped {entry}", file=sys.stderr)
 
     elif command == "list":
         index_file = engine.mcm_home / "registry" / "index.json"
