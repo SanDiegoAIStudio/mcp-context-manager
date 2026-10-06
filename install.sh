@@ -40,14 +40,8 @@ if ! command -v git &> /dev/null; then
 fi
 echo -e "${GREEN}✓ Git${NC}"
 
-# Install Python dependencies
 echo ""
-echo "Installing Python dependencies..."
-python3 -m pip install --user --quiet requests 2>/dev/null || {
-    echo -e "${YELLOW}⚠ Could not install 'requests' library${NC}"
-    echo "  You may need to install it manually: pip install requests"
-}
-echo -e "${GREEN}✓ Python packages${NC}"
+echo -e "${GREEN}✓ Python standard library only, nothing to install${NC}"
 
 # Create Claude Code directories
 echo ""
@@ -75,7 +69,7 @@ echo -e "${GREEN}✓ Directory structure${NC} ($MCM_HOME)"
 
 # Create default config
 if [[ ! -f "$MCM_HOME/config/mcm-config.json" ]]; then
-    cat > "$MCM_HOME/config/mcm-config.json" <<'EOF'
+    cat > "$MCM_HOME/config/mcm-config.json" <<EOF
 {
   "version": "1.0.0",
   "strategy": "balanced",
@@ -83,8 +77,8 @@ if [[ ! -f "$MCM_HOME/config/mcm-config.json" ]]; then
   "max_tool_budget_percent": 40,
   "auto_unload_after_messages": 3,
   "pinned_mcps": [],
-  "created_at": "'$(date -u +"%Y-%m-%dT%H:%M:%SZ")'",
-  "updated_at": "'$(date -u +"%Y-%m-%dT%H:%M:%SZ")'"
+  "created_at": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+  "updated_at": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 }
 EOF
     echo -e "${GREEN}✓ Created config${NC}"

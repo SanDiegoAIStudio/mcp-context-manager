@@ -8,8 +8,10 @@ import os
 import sys
 import json
 import subprocess
-import requests
+import socket
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, asdict
@@ -19,6 +21,54 @@ import hashlib
 # Configuration
 MCM_HOME = Path(os.getenv("MCM_HOME", Path.home() / ".mcm"))
 EXA_API_KEY = os.getenv("EXA_API_KEY", "")
+
+
+def http_request(
+    method: str,
+    url: str,
+    headers: Optional[Dict[str, str]] = None,
+    json_body: Optional[Dict] = None,
+    timeout: float = 30,
+) -> Tuple[int, str]:
+    """Send an HTTP request and return (status_code, response_text)."""
+    req_headers = dict(headers) if headers else {}
+    if "User-Agent" not in req_headers:
+        req_headers["User-Agent"] = "mcp-context-manager"
+
+    data = None
+    if json_body is not None:
+        req_headers["Content-Type"] = "application/json"
+        data = json.dumps(json_body).encode("utf-8")
+
+    request = urllib.request.Request(
+        url, data=data, headers=req_headers, method=method
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            status = response.getcode()
+            raw = response.read()
+            if isinstance(raw, bytes):
+                text = raw.decode("utf-8", errors="replace")
+            else:
+                text = raw or ""
+            return (status, text)
+    except urllib.error.HTTPError as exc:
+        try:
+            raw = exc.read()
+        except Exception:
+            raw = b""
+        if isinstance(raw, bytes):
+            body = raw.decode("utf-8", errors="replace")
+        else:
+            body = raw or ""
+        return (exc.code, body)
+    except urllib.error.URLError as exc:
+        reason = getattr(exc, "reason", None)
+        return (0, str(reason) if reason is not None else str(exc))
+    except (TimeoutError, socket.timeout) as exc:
+        return (0, str(exc))
+
 
 @dataclass
 class MCPMetadata:
@@ -98,9 +148,12 @@ class MCMEngine:
     def parse_mcp_input(self, input_text: str) -> List[Dict[str, str]]:
         """Parse user input and extract MCP identifiers"""
         mcps = []
-        lines = [line.strip() for line in input_text.strip().split("\n") if line.strip()]
 
-        for line in lines:
+        for raw in input_text.split("\n"):
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+
             mcp = {"original": line, "type": "unknown", "identifier": line}
 
             # GitHub URL
@@ -155,23 +208,23 @@ class MCMEngine:
         if github_token := os.getenv("GITHUB_TOKEN"):
             headers["Authorization"] = f"token {github_token}"
 
-        response = requests.get(api_url, headers=headers)
-        if response.status_code != 200:
-            raise Exception(f"GitHub API error: {response.status_code}")
+        status, text = http_request("GET", api_url, headers=headers)
+        if status != 200:
+            raise Exception(f"GitHub API error: {status}")
 
-        repo_data = response.json()
+        repo_data = json.loads(text)
 
         # Extract package.json if exists
         package_url = f"https://raw.githubusercontent.com/{repo_path}/main/package.json"
         try:
-            pkg_response = requests.get(package_url)
-            if pkg_response.status_code == 200:
-                package_json = pkg_response.json()
+            pkg_status, pkg_text = http_request("GET", package_url)
+            if pkg_status == 200:
+                package_json = json.loads(pkg_text)
             else:
                 # Try master branch
                 package_url = f"https://raw.githubusercontent.com/{repo_path}/master/package.json"
-                pkg_response = requests.get(package_url)
-                package_json = pkg_response.json() if pkg_response.status_code == 200 else {}
+                pkg_status, pkg_text = http_request("GET", package_url)
+                package_json = json.loads(pkg_text) if pkg_status == 200 else {}
         except:
             package_json = {}
 
@@ -200,11 +253,11 @@ class MCMEngine:
         package_name = mcp_info["identifier"]
         npm_url = f"https://registry.npmjs.org/{package_name}"
 
-        response = requests.get(npm_url)
-        if response.status_code != 200:
-            raise Exception(f"NPM registry error: {response.status_code}")
+        status, text = http_request("GET", npm_url)
+        if status != 200:
+            raise Exception(f"NPM registry error: {status}")
 
-        npm_data = response.json()
+        npm_data = json.loads(text)
         latest_version = npm_data["dist-tags"]["latest"]
         latest_data = npm_data["versions"][latest_version]
 
@@ -258,11 +311,13 @@ class MCMEngine:
             "type": "neural"
         }
 
-        response = requests.post("https://api.exa.ai/search", headers=headers, json=data)
-        if response.status_code != 200:
-            raise Exception(f"Exa.ai API error: {response.status_code}")
+        status, text = http_request(
+            "POST", "https://api.exa.ai/search", headers=headers, json_body=data
+        )
+        if status != 200:
+            raise Exception(f"Exa.ai API error: {status}")
 
-        results = response.json().get("results", [])
+        results = json.loads(text).get("results", [])
 
         # Try to find GitHub repo in results
         for result in results:
@@ -292,9 +347,8 @@ class MCMEngine:
         for file_path in possible_files:
             url = f"https://raw.githubusercontent.com/{repo_path}/main/{file_path}"
             try:
-                response = requests.get(url)
-                if response.status_code == 200:
-                    content = response.text
+                status, content = http_request("GET", url)
+                if status == 200:
                     # Simple pattern matching for tools
                     # Real implementation would parse AST
                     if "addTool" in content or "server.tool" in content:
