@@ -11,26 +11,20 @@ if [[ ! -f "$MCM_HOME/registry/index.json" ]]; then
     exit 1
 fi
 
-# Load credentials
-if [[ -f "$MCM_HOME/config/credentials.env" ]]; then
-    set -a
-    source "$MCM_HOME/config/credentials.env"
-    set +a
-fi
-
-# List MCPs
-python3 -c "
+python3 - "$MCM_HOME/registry/index.json" <<'PY'
 import json
-import os
+import sys
 
-with open('$MCM_HOME/registry/index.json') as f:
-    data = json.load(f)
+with open(sys.argv[1]) as handle:
+    data = json.load(handle)
 
-for mcp in data.get('mcps', []):
-    print(f\"✓ {mcp['name']}: {mcp['tool_count']} tools validated\")
-"
+for mcp in data.get("mcps", []):
+    name = mcp.get("name", "")
+    if mcp.get("inspected"):
+        print("✓ %s: inspected, %s tools" % (name, mcp.get("tool_count", 0)))
+    else:
+        print("· %s: not inspected (run: mcm inspect %s)" % (name, name))
+PY
 
 echo ""
-echo "✅ Validation complete!"
-echo ""
-echo "Note: This is a basic validation. Full testing requires MCP-specific credentials."
+echo "validate lists what MCM has saved. It does not start servers; mcm inspect does."
