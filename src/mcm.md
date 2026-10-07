@@ -5,13 +5,15 @@ description: MCP Context Manager - Automated MCP discovery and optimization
 Execute the MCP Context Manager command.
 
 **Available Commands:**
-- `/mcm discover` - Discover and optimize your MCPs (first-time setup)
-- `/mcm status` - Show current MCP status and context usage
-- `/mcm validate` - Validate all discovered MCPs
+- `/mcm discover` - Look up MCP servers by npm package or GitHub URL
+- `/mcm inspect <package>` - Start a server outside the conversation and list its tools
+- `/mcm status` - Show saved servers and inspected tool counts
+- `/mcm validate` - List what MCM has saved
 - `/mcm help` - Show detailed help
 
 **Instructions:**
 - For `/mcm discover`, ask the user for MCP names, npm packages or GitHub URLs (or use the ones they already gave), then run `bash ~/.claude/scripts/mcm/main.sh discover <name> [<name> ...]` and show the output.
+- For `/mcm inspect <package>`, before running it, tell the user that it runs that package's own code on their machine, the same as installing it, and ask them to confirm. Only after they say yes in this conversation run `bash ~/.claude/scripts/mcm/main.sh inspect <package> --yes`, adding ` -- <server args>` when the server needs arguments (for example a folder for the filesystem server). Never pass --yes without that yes.
 - For `/mcm status`, `/mcm validate` and `/mcm help`, run `bash ~/.claude/scripts/mcm/main.sh <command>` and show the output.
 
 **Example Execution:**

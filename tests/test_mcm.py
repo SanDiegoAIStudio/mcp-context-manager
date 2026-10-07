@@ -7,11 +7,14 @@ import io
 import json
 import os
 import re
+import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -20,6 +23,12 @@ from unittest.mock import Mock, patch
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SRC_DIR = REPO_ROOT / "src"
+FAKE = str(Path(__file__).resolve().parent / "fake_mcp_server.py")
+INSPECT_SCHEMA = {
+    "type": "object",
+    "properties": {"path": {"type": "string"}},
+    "required": ["path"],
+}
 ISO_CREATED_AT = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
 STUB_ENGINE = """#!/usr/bin/env python3
@@ -473,10 +482,15 @@ class HttpRequestTests(IsolatedHomeTest):
         thread.start()
         try:
             port = server.server_address[1]
-            status, text = engine_mod.http_request(
-                "GET",
-                "http://127.0.0.1:%d/start" % port,
-            )
+            try:
+                status, text = engine_mod.http_request(
+                    "GET",
+                    "http://127.0.0.1:%d/start" % port,
+                )
+            except ValueError as exc:
+                self.fail(
+                    "the redirect guard raised on a malformed Location: %r" % (exc,)
+                )
             self.assertEqual(status, 302)
         finally:
             server.shutdown()
@@ -755,6 +769,8 @@ class EngineMainTests(IsolatedHomeTest):
                     code = 0
                 except SystemExit as exc:
                     code = exc.code
+                except (ValueError, OSError) as exc:
+                    self.fail("a refused registry name escaped main: %r" % (exc,))
         self.assertEqual(code, 0)
         out = buf.getvalue()
         self.assertIn("../escape: not saved", out)
@@ -764,6 +780,31 @@ class EngineMainTests(IsolatedHomeTest):
             index = json.load(handle)
         names = [item["name"] for item in index.get("mcps", [])]
         self.assertIn("good-mcp", names)
+
+    def test_engine_runs_without_deprecation_warnings(self):
+        """source: every engine run printed datetime.utcnow() DeprecationWarnings on Python 3.12 and newer"""
+        list_file = self.tmp / "mcp-list.txt"
+        list_file.write_text("../not-a-package\n")
+        env = isolated_env(self.home)
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-W",
+                "error::DeprecationWarning",
+                str(SRC_DIR / "mcm_engine.py"),
+                "discover",
+                str(list_file),
+            ],
+            cwd=str(self.tmp),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        combined = proc.stdout + proc.stderr
+        self.assertNotIn("DeprecationWarning", combined)
+        self.assertNotIn("Traceback", combined)
+        self.assertIn("Discovered 0 of 1", combined)
 
 
 class ScanConfigTests(IsolatedHomeTest):
@@ -1060,6 +1101,489 @@ class ImportTests(unittest.TestCase):
                 sys.modules["requests"] = saved_requests
             else:
                 sys.modules.pop("requests", None)
+
+
+def install_fake_npx(bindir, record):
+    bindir.mkdir(parents=True)
+    script = bindir / "npx"
+    script.write_text(
+        "#!/bin/bash\n"
+        "printf '%s\\n' \"$*\" >> "
+        + shlex.quote(str(record))
+        + "\n"
+        "exec "
+        + shlex.quote(sys.executable)
+        + " "
+        + shlex.quote(FAKE)
+        + ' "$3"\n'
+    )
+    os.chmod(str(script), 0o755)
+
+
+def wait_until_gone(pid):
+    deadline = time.monotonic() + 5
+    while True:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.05)
+    raise AssertionError("pid %s was still running after 5 seconds" % pid)
+
+
+class InspectTests(IsolatedHomeTest):
+    def test_inspect_ok_trims_description_and_measures_schema(self):
+        """source: rail: inspect keeps a 200 character description, the schema size, and a token estimate"""
+        engine_mod = load_engine(self.mcm_home)
+        tools, tokens = engine_mod.inspect_command(
+            [sys.executable, FAKE, "ok"], timeout=10
+        )
+        self.assertEqual(len(tools), 2)
+        self.assertEqual(len(tools[0]["description"]), 200)
+        expected = len(
+            json.dumps(INSPECT_SCHEMA, sort_keys=True, separators=(",", ":"))
+        )
+        self.assertEqual(tools[0]["schema_size"], expected)
+        self.assertEqual(tools[1]["description"], "")
+        self.assertEqual(tools[1]["schema_size"], 0)
+        self.assertGreater(tokens, 0)
+
+    def test_inspect_paged_collects_every_page(self):
+        """source: rail: inspect follows nextCursor and collects every tools page"""
+        engine_mod = load_engine(self.mcm_home)
+        tools, _tokens = engine_mod.inspect_command(
+            [sys.executable, FAKE, "paged"], timeout=10
+        )
+        self.assertEqual(len(tools), 2)
+
+    def test_inspect_zero_tools(self):
+        """source: rail: a server with no tools is a successful empty inspection"""
+        engine_mod = load_engine(self.mcm_home)
+        self.assertEqual(
+            engine_mod.inspect_command([sys.executable, FAKE, "zero"], timeout=10),
+            ([], 0),
+        )
+
+    def test_inspect_silent_stops_process_group(self):
+        """source: rail: a server that does not answer is stopped, including the child it started"""
+        engine_mod = load_engine(self.mcm_home)
+        pidfile = self.tmp / "child.pid"
+        seen = {}
+
+        def watch():
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and "server" not in seen:
+                if pidfile.is_file():
+                    text = pidfile.read_text().strip()
+                    if text:
+                        try:
+                            child = int(text)
+                        except ValueError:
+                            time.sleep(0.01)
+                            continue
+                        seen["child"] = child
+                        try:
+                            out = subprocess.check_output(
+                                ["ps", "-o", "ppid=", "-p", str(child)],
+                                text=True,
+                                stderr=subprocess.DEVNULL,
+                            )
+                            ppid = int(out.strip())
+                        except (subprocess.CalledProcessError, ValueError, OSError):
+                            time.sleep(0.01)
+                            continue
+                        if ppid > 1:
+                            seen["server"] = ppid
+                            return
+                time.sleep(0.01)
+
+        watcher = threading.Thread(target=watch, daemon=True)
+        watcher.start()
+        started = time.monotonic()
+        try:
+            with self.assertRaises(engine_mod.InspectError) as ctx:
+                engine_mod.inspect_command(
+                    [sys.executable, FAKE, "silent", str(pidfile)],
+                    timeout=2,
+                )
+            elapsed = time.monotonic() - started
+            self.assertIn("did not answer within 2 seconds", str(ctx.exception))
+            self.assertLess(elapsed, 6)
+            watcher.join(timeout=1)
+            self.assertIn("child", seen)
+            self.assertIn("server", seen)
+            wait_until_gone(seen["server"])
+            wait_until_gone(seen["child"])
+        finally:
+            for key in ("child", "server"):
+                pid = seen.get(key)
+                if not pid or pid <= 1:
+                    continue
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    continue
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    def test_inspect_returns_on_time_when_a_child_escapes_the_group(self):
+        """source: planted fault I2: closing stdout under a blocked reader made inspect hang while an escaped child held the pipe"""
+        engine_mod = load_engine(self.mcm_home)
+        pidfile = self.tmp / "escape.pid"
+        caught = {}
+
+        def run():
+            try:
+                engine_mod.inspect_command(
+                    [sys.executable, FAKE, "escape", str(pidfile)],
+                    timeout=2,
+                )
+            except Exception as exc:
+                caught["error"] = exc
+
+        worker = threading.Thread(target=run)
+        worker.start()
+        try:
+            worker.join(timeout=15)
+            self.assertFalse(worker.is_alive())
+            self.assertIsInstance(caught.get("error"), engine_mod.InspectError)
+            self.assertIn("did not answer within 2 seconds", str(caught["error"]))
+        finally:
+            if pidfile.is_file():
+                try:
+                    os.kill(int(pidfile.read_text().strip()), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    def test_inspect_malformed_line(self):
+        """source: rail: a stdout line that is not JSON-RPC raises InspectError"""
+        engine_mod = load_engine(self.mcm_home)
+        with self.assertRaises(engine_mod.InspectError) as ctx:
+            engine_mod.inspect_command(
+                [sys.executable, FAKE, "malformed"], timeout=10
+            )
+        self.assertIn("not JSON-RPC", str(ctx.exception))
+
+    def test_inspect_tools_list_error(self):
+        """source: rail: a tools/list error is reported with the server's message"""
+        engine_mod = load_engine(self.mcm_home)
+        with self.assertRaises(engine_mod.InspectError) as ctx:
+            engine_mod.inspect_command([sys.executable, FAKE, "error"], timeout=10)
+        self.assertIn("no tools here", str(ctx.exception))
+
+    def test_inspect_exit_includes_stderr(self):
+        """source: rail: a server that exits first reports its exit code and stderr"""
+        engine_mod = load_engine(self.mcm_home)
+        with self.assertRaises(engine_mod.InspectError) as ctx:
+            engine_mod.inspect_command([sys.executable, FAKE, "exit"], timeout=10)
+        message = str(ctx.exception)
+        self.assertIn("exit code 3", message)
+        self.assertIn("boom", message)
+
+    def test_inspect_env_is_minimal_and_folder_removed(self):
+        """source: rail: the server receives only PATH, HOME, USER, LANG and TMPDIR, and its folder is removed"""
+        engine_mod = load_engine(self.mcm_home)
+        old_exa = os.environ.get("EXA_API_KEY")
+        old_github = os.environ.get("GITHUB_TOKEN")
+        os.environ["EXA_API_KEY"] = "test-exa"
+        os.environ["GITHUB_TOKEN"] = "test-github"
+        report = self.tmp / "env-report.json"
+        try:
+            _tools, _tokens = engine_mod.inspect_command(
+                [sys.executable, FAKE, "env", str(report)], timeout=10
+            )
+        finally:
+            if old_exa is None:
+                os.environ.pop("EXA_API_KEY", None)
+            else:
+                os.environ["EXA_API_KEY"] = old_exa
+            if old_github is None:
+                os.environ.pop("GITHUB_TOKEN", None)
+            else:
+                os.environ["GITHUB_TOKEN"] = old_github
+        with open(report) as handle:
+            info = json.loads(handle.read())
+        keys = info["keys"]
+        self.assertNotIn("EXA_API_KEY", keys)
+        self.assertNotIn("GITHUB_TOKEN", keys)
+        self.assertIn("PATH", keys)
+        self.assertNotEqual(info["cwd"], os.getcwd())
+        self.assertFalse(os.path.exists(info["cwd"]))
+
+    def test_inspect_ignores_server_noise(self):
+        """source: rail: notifications and requests from the server are ignored and never answered"""
+        engine_mod = load_engine(self.mcm_home)
+        try:
+            tools, _tokens = engine_mod.inspect_command(
+                [sys.executable, FAKE, "noise"], timeout=10
+            )
+        except engine_mod.InspectError as exc:
+            self.fail("a server message was taken as an answer: %s" % exc)
+        self.assertEqual(len(tools), 2)
+
+    def test_inspect_strips_control_characters(self):
+        """source: rail: control characters are removed from saved tool names and descriptions"""
+        engine_mod = load_engine(self.mcm_home)
+        tools, _tokens = engine_mod.inspect_command(
+            [sys.executable, FAKE, "ctrl"], timeout=10
+        )
+        self.assertGreaterEqual(len(tools), 1)
+        for tool in tools:
+            for text in (tool["name"], tool["description"]):
+                for ch in text:
+                    self.assertGreaterEqual(ord(ch), 32)
+                    self.assertNotEqual(ord(ch), 127)
+
+    def _run_inspect(self, args):
+        bindir = self.tmp / "bin"
+        record = self.tmp / "npx-record.txt"
+        install_fake_npx(bindir, record)
+        env = isolated_env(self.home)
+        env["PATH"] = str(bindir) + os.pathsep + env.get("PATH", "")
+        proc = subprocess.run(
+            [sys.executable, str(SRC_DIR / "mcm_engine.py")] + args,
+            cwd=str(self.tmp),
+            env=env,
+            input="",
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        return proc, record
+
+    def test_inspect_cli_without_yes_does_not_start(self):
+        """source: rail: without --yes and without a terminal, the server is not started"""
+        proc, record = self._run_inspect(["inspect", "fake-pkg"])
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn(
+            "This runs fake-pkg's own code on your machine, the same as installing it.",
+            proc.stdout,
+        )
+        self.assertIn(
+            "Not started. Run it again with --yes to continue.",
+            proc.stdout,
+        )
+        self.assertFalse(record.exists())
+        self.assertFalse((self.mcm_home / "registry" / "index.json").exists())
+
+    def test_inspect_cli_yes_saves_names_and_schema_sizes(self):
+        """source: rail: --yes saves tool names, short descriptions and schema sizes, not full schemas"""
+        proc, _record = self._run_inspect(
+            ["inspect", "fake-pkg", "--yes", "--", "ok"]
+        )
+        self.assertEqual(
+            proc.returncode, 0, proc.stdout + "\n" + proc.stderr
+        )
+        self.assertIn("fake-pkg: 2 tools", proc.stdout)
+        index_path = self.mcm_home / "registry" / "index.json"
+        with open(str(index_path)) as handle:
+            index = json.load(handle)
+        entry = [item for item in index["mcps"] if item["name"] == "fake-pkg"][0]
+        self.assertTrue(entry["inspected"])
+        self.assertEqual(entry["tool_count"], 2)
+        meta_path = self.mcm_home / "registry" / "fake-pkg" / "metadata.json"
+        text = meta_path.read_text()
+        self.assertNotIn("inputSchema", text)
+        self.assertNotIn("properties", text)
+
+    def test_inspect_cli_rejects_invalid_package_name(self):
+        """source: rail: a name that is not an npm package never starts a server"""
+        proc, record = self._run_inspect(["inspect", "../evil", "--yes"])
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("not an npm package name", proc.stdout + proc.stderr)
+        self.assertFalse(record.exists())
+
+    def _write_status_index(self):
+        self.mcm_home.mkdir(parents=True)
+        registry = self.mcm_home / "registry"
+        registry.mkdir()
+        index = {
+            "mcps": [
+                {
+                    "name": "a-server",
+                    "source": "npm",
+                    "tool_count": 2,
+                    "format": "cli",
+                    "discovered_at": "x",
+                    "inspected": True,
+                    "context_tokens": 150,
+                },
+                {
+                    "name": "b-server",
+                    "source": "npm",
+                    "tool_count": 1,
+                    "format": "cli",
+                    "discovered_at": "x",
+                },
+            ]
+        }
+        (registry / "index.json").write_text(json.dumps(index))
+
+    def test_status_shows_real_counts_only_when_inspected(self):
+        """source: rail: status shows real counts for inspected servers and not inspected for the rest"""
+        self._write_status_index()
+        env = isolated_env(self.home)
+        proc = subprocess.run(
+            ["bash", str(SRC_DIR / "commands" / "status.sh")],
+            cwd=str(self.tmp),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        lines = proc.stdout.splitlines()
+        a_line = [line for line in lines if "a-server" in line][0]
+        b_line = [line for line in lines if "b-server" in line][0]
+        self.assertIn("2 tools", a_line)
+        self.assertIn("~150 tokens", a_line)
+        self.assertIn("not inspected", b_line)
+        self.assertIn("Inspected 1 of 2", proc.stdout)
+
+    def test_validate_marks_uninspected_servers(self):
+        """source: rail: validate shows not inspected and does not claim servers were validated"""
+        self._write_status_index()
+        env = isolated_env(self.home)
+        proc = subprocess.run(
+            ["bash", str(SRC_DIR / "commands" / "validate.sh")],
+            cwd=str(self.tmp),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        b_line = [
+            line for line in proc.stdout.splitlines() if "b-server" in line
+        ][0]
+        self.assertIn("not inspected", b_line)
+        self.assertNotIn("validated", proc.stdout)
+        self.assertNotIn("validated", proc.stderr)
+
+    def test_discover_from_npm_keeps_requested_package_name(self):
+        """source: rail: discover keeps the npm package name the user asked for"""
+        engine_mod = load_engine(self.mcm_home)
+        npm_doc = {
+            "name": "servers",
+            "dist-tags": {"latest": "1.0.0"},
+            "versions": {
+                "1.0.0": {
+                    "description": "d",
+                    "repository": {
+                        "url": "git+https://github.com/owner/servers.git"
+                    },
+                }
+            },
+        }
+
+        def fake_http(method, url, headers=None, json_body=None, timeout=30):
+            if "registry.npmjs.org" in url:
+                return (200, json.dumps(npm_doc))
+            if "api.github.com/repos/owner/servers" in url:
+                return (
+                    200,
+                    json.dumps(
+                        {
+                            "name": "servers",
+                            "html_url": "https://github.com/owner/servers",
+                            "description": "d",
+                        }
+                    ),
+                )
+            if "raw.githubusercontent.com" in url:
+                return (404, "")
+            return (404, "")
+
+        engine = engine_mod.MCMEngine()
+        with patch.object(engine_mod, "http_request", side_effect=fake_http):
+            metadata = engine.discover_from_npm(
+                {
+                    "identifier": "@scope/server-x",
+                    "type": "npm_package",
+                    "original": "@scope/server-x",
+                }
+            )
+        self.assertEqual(metadata.name, "@scope/server-x")
+        self.assertFalse(metadata.inspected)
+
+    def test_discover_does_not_start_a_process(self):
+        """source: rail: a server starts only when the person types inspect for a named package"""
+        engine_mod = load_engine(self.mcm_home)
+        list_file = self.tmp / "one.txt"
+        list_file.write_text("demo-mcp\n")
+        npm_doc = {
+            "name": "demo-mcp",
+            "dist-tags": {"latest": "1.0.0"},
+            "versions": {
+                "1.0.0": {
+                    "description": "d",
+                    "repository": {"url": "https://gitlab.com/example/demo-mcp"},
+                }
+            },
+        }
+        popen = Mock()
+        with patch.object(engine_mod.subprocess, "Popen", popen), patch.object(
+            engine_mod, "http_request", return_value=(200, json.dumps(npm_doc))
+        ), patch.object(engine_mod.time, "sleep"), patch.object(
+            engine_mod.sys,
+            "argv",
+            ["mcm_engine.py", "discover", str(list_file)],
+        ):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                engine_mod.main()
+        popen.assert_not_called()
+
+    def test_save_metadata_keeps_inspected_entry(self):
+        """source: rail: saving a package again without inspection keeps the inspected tool count"""
+        engine_mod = load_engine(self.mcm_home)
+        engine = engine_mod.MCMEngine()
+        inspected = engine_mod.MCPMetadata(
+            name="demo-mcp",
+            source="npm",
+            url="https://www.npmjs.com/package/demo-mcp",
+            description="",
+            tools=[
+                {"name": "a", "description": "", "schema_size": 1},
+                {"name": "b", "description": "", "schema_size": 2},
+            ],
+            tool_count=2,
+            complexity_score=2.0,
+            context_cost_estimate=10,
+            dependencies=[],
+            credentials_needed=[],
+            discovered_at="2020-01-01T00:00:00Z",
+            format="cli",
+            inspected=True,
+            inspected_at="2020-01-01T00:00:00Z",
+        )
+        plain = engine_mod.MCPMetadata(
+            name="demo-mcp",
+            source="npm",
+            url="https://www.npmjs.com/package/demo-mcp",
+            description="later",
+            tools=[],
+            tool_count=0,
+            complexity_score=0.0,
+            context_cost_estimate=0,
+            dependencies=[],
+            credentials_needed=[],
+            discovered_at="2021-01-01T00:00:00Z",
+            format="direct",
+        )
+        engine.save_metadata(inspected)
+        meta_path = self.mcm_home / "registry" / "demo-mcp" / "metadata.json"
+        before = meta_path.read_text()
+        engine.save_metadata(plain)
+        self.assertEqual(meta_path.read_text(), before)
+        index = json.loads((self.mcm_home / "registry" / "index.json").read_text())
+        entry = [item for item in index["mcps"] if item["name"] == "demo-mcp"][0]
+        self.assertTrue(entry["inspected"])
+        self.assertEqual(entry["tool_count"], 2)
 
 
 if __name__ == "__main__":
