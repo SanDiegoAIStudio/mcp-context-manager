@@ -71,6 +71,11 @@ else
                 exit 1
             fi
 
+            echo "These names will be looked up on npm or GitHub:"
+            while IFS= read -r line || [[ -n "${line:-}" ]]; do
+                echo "  $line"
+            done < "$MCP_INPUT_FILE"
+
             MCP_COUNT=$(wc -l < "$MCP_INPUT_FILE" | tr -d ' ')
             echo "Found $MCP_COUNT MCPs. Proceed with discovery? (y/n)"
             read -p "> " proceed

@@ -92,10 +92,6 @@ if [[ ! -f "$MCM_HOME/config/credentials.env" ]]; then
 # MCP Context Manager - Credentials
 # Fill in your API keys below
 
-# Exa.ai (for better MCP discovery)
-# Get key from: https://exa.ai
-EXA_API_KEY=
-
 # GitHub (for GitHub MCP)
 # Get token from: https://github.com/settings/tokens
 # Needs scopes: repo, read:org

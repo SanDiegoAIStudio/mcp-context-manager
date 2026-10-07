@@ -11,10 +11,12 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 import urllib.error
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SRC_DIR = REPO_ROOT / "src"
@@ -230,30 +232,65 @@ class ParseMcpInputTests(IsolatedHomeTest):
         self.assertEqual(by_original["filesystem"]["type"], "npm_package")
         self.assertEqual(by_original["filesystem"]["identifier"], "filesystem")
 
+    def test_parse_rejects_traversal_and_paths(self):
+        """source: untrusted-input-to-authenticated-request-and-path"""
+        engine_mod = load_engine(self.mcm_home)
+        engine = engine_mod.MCMEngine()
+        lines = [
+            "https://github.com/owner/repo/../../user",
+            "https://github.com/owner/repo.git",
+            "https://github.com/owner/..",
+            "@scope/pkg",
+            "../etc/passwd",
+            "/srv/mcp/server.js",
+            "name with spaces",
+            "filesystem",
+        ]
+        parsed = engine.parse_mcp_input("\n".join(lines))
+        by_original = dict((item["original"], item) for item in parsed)
+        self.assertEqual(
+            by_original["https://github.com/owner/repo/../../user"]["type"], "invalid"
+        )
+        self.assertEqual(
+            by_original["https://github.com/owner/repo.git"]["type"], "github_url"
+        )
+        self.assertEqual(
+            by_original["https://github.com/owner/repo.git"]["identifier"], "owner/repo"
+        )
+        self.assertEqual(by_original["https://github.com/owner/.."]["type"], "invalid")
+        self.assertEqual(by_original["@scope/pkg"]["type"], "npm_package")
+        self.assertEqual(by_original["../etc/passwd"]["type"], "invalid")
+        self.assertEqual(by_original["/srv/mcp/server.js"]["type"], "invalid")
+        self.assertEqual(by_original["name with spaces"]["type"], "invalid")
+        self.assertEqual(by_original["filesystem"]["type"], "npm_package")
+
 
 class HttpRequestTests(IsolatedHomeTest):
     def test_http_request_success_http_error_and_url_error(self):
         """source: engine called requests.get/post instead of stdlib HTTP"""
         engine_mod = load_engine(self.mcm_home)
 
-        with patch(
-            "urllib.request.urlopen",
+        with patch.object(
+            engine_mod,
+            "open_url",
             return_value=FakeHTTPResponse(200, "ok-body"),
         ):
             status, text = engine_mod.http_request("GET", "http://example.test/ok")
         self.assertEqual(status, 200)
         self.assertEqual(text, "ok-body")
 
-        with patch(
-            "urllib.request.urlopen",
+        with patch.object(
+            engine_mod,
+            "open_url",
             side_effect=make_http_error("http://example.test/missing", 404, "nope"),
         ):
             status, text = engine_mod.http_request("GET", "http://example.test/missing")
         self.assertEqual(status, 404)
         self.assertEqual(text, "nope")
 
-        with patch(
-            "urllib.request.urlopen",
+        with patch.object(
+            engine_mod,
+            "open_url",
             side_effect=urllib.error.URLError("network down"),
         ):
             status, text = engine_mod.http_request("GET", "http://example.test/down")
@@ -269,7 +306,7 @@ class HttpRequestTests(IsolatedHomeTest):
             recorded.append(request)
             return FakeHTTPResponse(200, "{}")
 
-        with patch("urllib.request.urlopen", side_effect=capture_urlopen):
+        with patch.object(engine_mod, "open_url", side_effect=capture_urlopen):
             engine_mod.http_request(
                 "POST",
                 "http://example.test/search",
@@ -297,6 +334,97 @@ class HttpRequestTests(IsolatedHomeTest):
         self.assertEqual(headers.get("user-agent"), "custom-agent")
         self.assertNotIn("content-type", headers)
         self.assertIsNone(request.data)
+
+    def test_cross_host_redirect_is_refused(self):
+        """source: credential-leak-on-redirect"""
+        engine_mod = load_engine(self.mcm_home)
+        b_requests = []
+
+        class BHandler(BaseHTTPRequestHandler):
+            def log_message(self, format, *args):
+                return
+
+            def do_GET(self):
+                b_requests.append(dict(self.headers))
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"ok")
+
+        class AHandler(BaseHTTPRequestHandler):
+            b_port = 0
+
+            def log_message(self, format, *args):
+                return
+
+            def do_GET(self):
+                self.send_response(302)
+                self.send_header(
+                    "Location",
+                    "http://127.0.0.1:%d/steal" % AHandler.b_port,
+                )
+                self.end_headers()
+
+        server_b = ThreadingHTTPServer(("127.0.0.1", 0), BHandler)
+        server_a = ThreadingHTTPServer(("127.0.0.1", 0), AHandler)
+        AHandler.b_port = server_b.server_address[1]
+        thread_b = threading.Thread(target=server_b.serve_forever, daemon=True)
+        thread_a = threading.Thread(target=server_a.serve_forever, daemon=True)
+        thread_b.start()
+        thread_a.start()
+        try:
+            a_port = server_a.server_address[1]
+            status, text = engine_mod.http_request(
+                "GET",
+                "http://127.0.0.1:%d/start" % a_port,
+                headers={"x-api-key": "k", "Authorization": "token t"},
+            )
+            self.assertEqual(status, 302)
+            self.assertEqual(b_requests, [])
+        finally:
+            server_a.shutdown()
+            server_b.shutdown()
+            server_a.server_close()
+            server_b.server_close()
+
+    def test_same_host_redirect_is_followed(self):
+        """source: credential-leak-on-redirect"""
+        engine_mod = load_engine(self.mcm_home)
+
+        class AHandler(BaseHTTPRequestHandler):
+            def log_message(self, format, *args):
+                return
+
+            def do_GET(self):
+                port = self.server.server_address[1]
+                if self.path == "/start":
+                    self.send_response(302)
+                    self.send_header(
+                        "Location",
+                        "http://127.0.0.1:%d/end" % port,
+                    )
+                    self.end_headers()
+                elif self.path == "/end":
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(b"done")
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+        server_a = ThreadingHTTPServer(("127.0.0.1", 0), AHandler)
+        thread_a = threading.Thread(target=server_a.serve_forever, daemon=True)
+        thread_a.start()
+        try:
+            a_port = server_a.server_address[1]
+            status, text = engine_mod.http_request(
+                "GET",
+                "http://127.0.0.1:%d/start" % a_port,
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(text, "done")
+        finally:
+            server_a.shutdown()
+            server_a.server_close()
 
 
 class NpmDiscoverTests(IsolatedHomeTest):
@@ -339,6 +467,33 @@ class NpmDiscoverTests(IsolatedHomeTest):
         names = [item["name"] for item in index.get("mcps", [])]
         self.assertIn("demo-mcp", names)
 
+    def test_npm_lookup_says_what_it_sends(self):
+        """source: information-disclosure-to-third-party"""
+        engine_mod = load_engine(self.mcm_home)
+        npm_doc = {
+            "name": "demo-mcp",
+            "dist-tags": {"latest": "1.2.3"},
+            "versions": {
+                "1.2.3": {
+                    "description": "Demo MCP",
+                    "repository": {"url": "git+https://gitlab.com/example/demo-mcp.git"},
+                    "dependencies": {"left-pad": "1.0.0"},
+                }
+            },
+        }
+
+        def fake_http(method, url, headers=None, json_body=None, timeout=30):
+            return (200, json.dumps(npm_doc))
+
+        engine = engine_mod.MCMEngine()
+        with patch.object(engine_mod, "http_request", side_effect=fake_http):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                engine.discover_from_npm(
+                    {"identifier": "demo-mcp", "type": "npm_package"}
+                )
+        self.assertIn("  → registry.npmjs.org: demo-mcp", buf.getvalue())
+
     def test_discover_from_npm_connection_error_includes_reason(self):
         """source: a lookup that could not connect raised 'NPM registry error: 0' and dropped the reason"""
         engine_mod = load_engine(self.mcm_home)
@@ -347,6 +502,87 @@ class NpmDiscoverTests(IsolatedHomeTest):
             with self.assertRaises(Exception) as ctx:
                 engine.discover_from_npm({"identifier": "demo-mcp", "type": "npm_package"})
         self.assertIn("could not connect (network down)", str(ctx.exception))
+
+
+class InputSafetyTests(IsolatedHomeTest):
+    def test_invalid_entry_sends_nothing(self):
+        """source: untrusted-input-to-authenticated-request-and-path"""
+        engine_mod = load_engine(self.mcm_home)
+        engine = engine_mod.MCMEngine()
+        parsed = engine.parse_mcp_input("../etc/passwd")
+        self.assertEqual(len(parsed), 1)
+        mock_http = Mock()
+        with patch.object(engine_mod, "http_request", mock_http):
+            result = engine.discover_mcp(parsed[0])
+            self.assertIsNone(result)
+            mock_http.assert_not_called()
+            with self.assertRaises(Exception):
+                engine.discover_from_github(
+                    {"identifier": "owner/repo/../../user", "type": "github_url"}
+                )
+            mock_http.assert_not_called()
+
+    def test_safe_child_refuses_escapes(self):
+        """source: untrusted-input-to-authenticated-request-and-path"""
+        engine_mod = load_engine(self.mcm_home)
+        engine = engine_mod.MCMEngine()
+        root = self.mcm_home / "registry"
+        with self.assertRaises(ValueError):
+            engine_mod.safe_child(root, "../x")
+        with self.assertRaises(ValueError):
+            engine_mod.safe_child(root, "a/../../x")
+        with self.assertRaises(ValueError):
+            engine_mod.safe_child(root, "/etc/x")
+        child = engine_mod.safe_child(root, "@scope/pkg")
+        self.assertTrue(child.is_relative_to(root.resolve()))
+        self.assertNotEqual(child, root.resolve())
+
+        metadata = engine_mod.MCPMetadata(
+            name="../escape",
+            source="npm",
+            url="http://example.test",
+            description="",
+            tools=[],
+            tool_count=0,
+            complexity_score=0.0,
+            context_cost_estimate=0,
+            dependencies=[],
+            credentials_needed=[],
+            discovered_at="2020-01-01T00:00:00Z",
+            format="direct",
+        )
+        with self.assertRaises(ValueError):
+            engine.save_metadata(metadata)
+        self.assertFalse((self.mcm_home / "escape").exists())
+
+    def test_no_search_service(self):
+        """source: information-disclosure-to-third-party: a plain name went to Exa's search API"""
+        engine_mod = load_engine(self.mcm_home)
+        engine = engine_mod.MCMEngine()
+        mock_http = Mock()
+        old_exa = os.environ.get("EXA_API_KEY")
+        os.environ["EXA_API_KEY"] = "test-key"
+        try:
+            with patch.object(engine_mod, "http_request", mock_http):
+                buf = io.StringIO()
+                err = io.StringIO()
+                with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
+                    result = engine.discover_mcp(
+                        {
+                            "type": "name",
+                            "identifier": "plainname",
+                            "original": "plainname",
+                        }
+                    )
+            self.assertIsNone(result)
+            mock_http.assert_not_called()
+            combined = buf.getvalue() + err.getvalue()
+            self.assertIn("Skipped 'plainname'", combined)
+        finally:
+            if old_exa is None:
+                os.environ.pop("EXA_API_KEY", None)
+            else:
+                os.environ["EXA_API_KEY"] = old_exa
 
 
 class EngineMainTests(IsolatedHomeTest):
