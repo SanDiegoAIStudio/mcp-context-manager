@@ -264,6 +264,35 @@ class ParseMcpInputTests(IsolatedHomeTest):
         self.assertEqual(by_original["name with spaces"]["type"], "invalid")
         self.assertEqual(by_original["filesystem"]["type"], "npm_package")
 
+    def test_parse_accepts_schemeless_and_tree_github_links(self):
+        """source: push review of 5034ea7: scheme-less and /tree/ GitHub links were refused"""
+        engine_mod = load_engine(self.mcm_home)
+        engine = engine_mod.MCMEngine()
+        parsed = engine.parse_mcp_input(
+            "\n".join(
+                [
+                    "github.com/owner/repo",
+                    "https://github.com/owner/repo/tree/main/src/filesystem",
+                    "https://github.com/owner/repo/../../user",
+                    "https://github.com/owner/repo/issues/1",
+                ]
+            )
+        )
+        by_original = dict((item["original"], item) for item in parsed)
+        self.assertEqual(by_original["github.com/owner/repo"]["type"], "github_url")
+        self.assertEqual(
+            by_original["github.com/owner/repo"]["identifier"], "owner/repo"
+        )
+        tree_url = "https://github.com/owner/repo/tree/main/src/filesystem"
+        self.assertEqual(by_original[tree_url]["type"], "github_url")
+        self.assertEqual(by_original[tree_url]["identifier"], "owner/repo")
+        self.assertEqual(
+            by_original["https://github.com/owner/repo/../../user"]["type"], "invalid"
+        )
+        self.assertEqual(
+            by_original["https://github.com/owner/repo/issues/1"]["type"], "invalid"
+        )
+
 
 class HttpRequestTests(IsolatedHomeTest):
     def test_http_request_success_http_error_and_url_error(self):
@@ -426,6 +455,45 @@ class HttpRequestTests(IsolatedHomeTest):
             server_a.shutdown()
             server_a.server_close()
 
+    def test_malformed_location_header_does_not_raise(self):
+        """source: push review of 5034ea7: a malformed Location header made the redirect guard raise"""
+        engine_mod = load_engine(self.mcm_home)
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, format, *args):
+                return
+
+            def do_GET(self):
+                self.send_response(302)
+                self.send_header("Location", "http://127.0.0.1:99999999/x")
+                self.end_headers()
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            status, text = engine_mod.http_request(
+                "GET",
+                "http://127.0.0.1:%d/start" % port,
+            )
+            self.assertEqual(status, 302)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_http_error_explains_refused_redirect(self):
+        """source: push review of 5034ea7: a refused redirect read as a bare 302"""
+        engine_mod = load_engine(self.mcm_home)
+        self.assertEqual(
+            str(engine_mod.http_error("GitHub API error", 302, "")),
+            "GitHub API error: 302 (a redirect to another host was refused)",
+        )
+        self.assertEqual(
+            str(engine_mod.http_error("GitHub API error", 404, "")),
+            "GitHub API error: 404",
+        )
+
 
 class NpmDiscoverTests(IsolatedHomeTest):
     def test_discover_from_npm_non_github_and_save_metadata(self):
@@ -502,6 +570,43 @@ class NpmDiscoverTests(IsolatedHomeTest):
             with self.assertRaises(Exception) as ctx:
                 engine.discover_from_npm({"identifier": "demo-mcp", "type": "npm_package"})
         self.assertIn("could not connect (network down)", str(ctx.exception))
+
+    def test_discover_from_github_skips_source_files_and_announces_package_json(self):
+        """source: push review of 5034ea7: discover fetched source files to guess tools and did not announce its package.json request"""
+        engine_mod = load_engine(self.mcm_home)
+        recorded = []
+
+        def fake_http(method, url, headers=None, json_body=None, timeout=30):
+            recorded.append(url)
+            if "api.github.com" in url:
+                return (
+                    200,
+                    json.dumps(
+                        {
+                            "name": "repo",
+                            "html_url": "https://github.com/owner/repo",
+                            "description": "d",
+                        }
+                    ),
+                )
+            return (404, "")
+
+        engine = engine_mod.MCMEngine()
+        buf = io.StringIO()
+        with patch.object(engine_mod, "http_request", side_effect=fake_http):
+            with contextlib.redirect_stdout(buf):
+                metadata = engine.discover_from_github(
+                    {"identifier": "owner/repo", "type": "github_url"}
+                )
+        self.assertEqual(metadata.tools, [])
+        self.assertEqual(metadata.tool_count, 0)
+        for url in recorded:
+            self.assertNotIn("/src/", url)
+            self.assertFalse(url.endswith(".ts") or url.endswith(".js"))
+        self.assertIn(
+            "  → raw.githubusercontent.com: owner/repo package.json",
+            buf.getvalue(),
+        )
 
 
 class InputSafetyTests(IsolatedHomeTest):
@@ -600,6 +705,65 @@ class EngineMainTests(IsolatedHomeTest):
                     engine_mod.main()
         self.assertEqual(ctx.exception.code, 1)
         self.assertIn("Discovered 0 of 1", buf.getvalue())
+
+    def test_discover_continues_when_save_refuses_a_name(self):
+        """source: push review of 5034ea7: a refused registry name aborted the whole run"""
+        engine_mod = load_engine(self.mcm_home)
+        list_file = self.tmp / "mcp-list.txt"
+        list_file.write_text("bad-mcp\ngood-mcp\n")
+        metas = [
+            engine_mod.MCPMetadata(
+                name="../escape",
+                source="npm",
+                url="http://example.test",
+                description="",
+                tools=[],
+                tool_count=0,
+                complexity_score=0.0,
+                context_cost_estimate=0,
+                dependencies=[],
+                credentials_needed=[],
+                discovered_at="2020-01-01T00:00:00Z",
+                format="direct",
+            ),
+            engine_mod.MCPMetadata(
+                name="good-mcp",
+                source="npm",
+                url="http://example.test",
+                description="",
+                tools=[],
+                tool_count=0,
+                complexity_score=0.0,
+                context_cost_estimate=0,
+                dependencies=[],
+                credentials_needed=[],
+                discovered_at="2020-01-01T00:00:00Z",
+                format="direct",
+            ),
+        ]
+        with patch.object(
+            engine_mod.MCMEngine, "discover_mcp", side_effect=metas
+        ), patch.object(engine_mod.time, "sleep"), patch.object(
+            engine_mod.sys,
+            "argv",
+            ["mcm_engine.py", "discover", str(list_file)],
+        ):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                try:
+                    engine_mod.main()
+                    code = 0
+                except SystemExit as exc:
+                    code = exc.code
+        self.assertEqual(code, 0)
+        out = buf.getvalue()
+        self.assertIn("../escape: not saved", out)
+        self.assertIn("Discovered 1 of 2", out)
+        index_path = self.mcm_home / "registry" / "index.json"
+        with open(str(index_path)) as handle:
+            index = json.load(handle)
+        names = [item["name"] for item in index.get("mcps", [])]
+        self.assertIn("good-mcp", names)
 
 
 class ScanConfigTests(IsolatedHomeTest):

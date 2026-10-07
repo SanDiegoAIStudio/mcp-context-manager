@@ -27,7 +27,7 @@ NPM_NAME = re.compile(
     r"(?:@[A-Za-z0-9][A-Za-z0-9._~-]*/)?[A-Za-z0-9][A-Za-z0-9._~-]*"
 )
 GITHUB_URL = re.compile(
-    r"https?://(?:www\.)?github\.com/([A-Za-z0-9][A-Za-z0-9-]{0,38})/([A-Za-z0-9._-]{1,100})/?"
+    r"(?:https?://)?(?:www\.)?github\.com/([A-Za-z0-9][A-Za-z0-9-]{0,38})/([A-Za-z0-9._-]{1,100})(?:/(?:tree|blob)/\S*)?/?"
 )
 GITHUB_REPO = re.compile(
     r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}"
@@ -36,14 +36,17 @@ GITHUB_REPO = re.compile(
 
 class SameHostRedirectHandler(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        old = urllib.parse.urlsplit(req.full_url)
-        new = urllib.parse.urlsplit(newurl)
-        old_port = old.port
-        if old_port is None:
-            old_port = 443 if old.scheme == "https" else 80
-        new_port = new.port
-        if new_port is None:
-            new_port = 443 if new.scheme == "https" else 80
+        try:
+            old = urllib.parse.urlsplit(req.full_url)
+            new = urllib.parse.urlsplit(newurl)
+            old_port = old.port
+            if old_port is None:
+                old_port = 443 if old.scheme == "https" else 80
+            new_port = new.port
+            if new_port is None:
+                new_port = 443 if new.scheme == "https" else 80
+        except ValueError:
+            return None
         old_host = old.hostname
         new_host = new.hostname
         if old_host is None or new_host is None:
@@ -114,6 +117,8 @@ def http_request(
 def http_error(label: str, status: int, text: str) -> Exception:
     if status == 0:
         return Exception(f"{label}: could not connect ({text})")
+    if 300 <= status <= 399:
+        return Exception(f"{label}: {status} (a redirect to another host was refused)")
     return Exception(f"{label}: {status}")
 
 
@@ -316,6 +321,7 @@ class MCMEngine:
         repo_data = json.loads(text)
 
         # Extract package.json if exists
+        print(f"  → raw.githubusercontent.com: {repo_path} package.json")
         package_url = f"https://raw.githubusercontent.com/{repo_path}/main/package.json"
         try:
             pkg_status, pkg_text = http_request("GET", package_url)
@@ -329,22 +335,19 @@ class MCMEngine:
         except:
             package_json = {}
 
-        # Analyze repository structure
-        tools = self.analyze_mcp_tools(repo_path, headers)
-
         metadata = MCPMetadata(
             name=repo_data["name"],
             source="github",
             url=repo_data["html_url"],
             description=repo_data.get("description", ""),
-            tools=tools,
-            tool_count=len(tools),
-            complexity_score=self.calculate_complexity(tools),
-            context_cost_estimate=self.estimate_context_cost(tools),
+            tools=[],
+            tool_count=0,
+            complexity_score=0.0,
+            context_cost_estimate=0,
             dependencies=list(package_json.get("dependencies", {}).keys()) if package_json else [],
-            credentials_needed=self.detect_credentials(tools),
+            credentials_needed=self.detect_credentials([]),
             discovered_at=datetime.utcnow().isoformat() + "Z",
-            format=self.determine_optimal_format(tools)
+            format="direct"
         )
 
         return metadata
@@ -392,45 +395,6 @@ class MCMEngine:
         )
 
         return metadata
-
-    def analyze_mcp_tools(self, repo_path: str, headers: Dict) -> List[Dict]:
-        """Analyze MCP repository to extract tool definitions"""
-        # This is a simplified version - would need more sophisticated analysis
-        tools = []
-
-        # Try to fetch common MCP server files
-        possible_files = [
-            "src/index.ts",
-            "src/index.js",
-            "index.ts",
-            "index.js",
-            "server.ts",
-            "server.js"
-        ]
-
-        print(f"  → raw.githubusercontent.com: {repo_path} source files")
-        for file_path in possible_files:
-            url = f"https://raw.githubusercontent.com/{repo_path}/main/{file_path}"
-            try:
-                status, content = http_request("GET", url)
-                if status == 200:
-                    # Simple pattern matching for tools
-                    # Real implementation would parse AST
-                    if "addTool" in content or "server.tool" in content:
-                        # Extract tool names (simplified)
-                        import re
-                        tool_patterns = re.findall(r'name:\s*["\']([^"\']+)["\']', content)
-                        for tool_name in tool_patterns:
-                            tools.append({
-                                "name": tool_name,
-                                "description": "",
-                                "parameters": []
-                            })
-                    break
-            except:
-                continue
-
-        return tools if tools else [{"name": "unknown", "description": "", "parameters": []}]
 
     def calculate_complexity(self, tools: List[Dict]) -> float:
         """Calculate complexity score for tools"""
@@ -620,9 +584,13 @@ def main():
             metadata = engine.discover_mcp(mcp_info)
 
             if metadata:
-                engine.save_metadata(metadata)
-                print(f"  ✓ {metadata.name}: {metadata.tool_count} tools, format: {metadata.format}")
-                ok += 1
+                try:
+                    engine.save_metadata(metadata)
+                except (ValueError, OSError) as exc:
+                    print(f"  ✗ {metadata.name}: not saved ({exc})")
+                else:
+                    print(f"  ✓ {metadata.name}: saved")
+                    ok += 1
             else:
                 print(f"  ✗ Failed to discover")
 
