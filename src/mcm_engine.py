@@ -7,10 +7,12 @@ Handles discovery, analysis, conversion, and management of MCPs
 import os
 import sys
 import json
+import re
 import subprocess
 import socket
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -20,7 +22,46 @@ import hashlib
 
 # Configuration
 MCM_HOME = Path(os.getenv("MCM_HOME", Path.home() / ".mcm"))
-EXA_API_KEY = os.getenv("EXA_API_KEY", "")
+
+NPM_NAME = re.compile(
+    r"(?:@[A-Za-z0-9][A-Za-z0-9._~-]*/)?[A-Za-z0-9][A-Za-z0-9._~-]*"
+)
+GITHUB_URL = re.compile(
+    r"https?://(?:www\.)?github\.com/([A-Za-z0-9][A-Za-z0-9-]{0,38})/([A-Za-z0-9._-]{1,100})/?"
+)
+GITHUB_REPO = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}"
+)
+
+
+class SameHostRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        old = urllib.parse.urlsplit(req.full_url)
+        new = urllib.parse.urlsplit(newurl)
+        old_port = old.port
+        if old_port is None:
+            old_port = 443 if old.scheme == "https" else 80
+        new_port = new.port
+        if new_port is None:
+            new_port = 443 if new.scheme == "https" else 80
+        old_host = old.hostname
+        new_host = new.hostname
+        if old_host is None or new_host is None:
+            return None
+        if (
+            old.scheme != new.scheme
+            or old_host.lower() != new_host.lower()
+            or old_port != new_port
+        ):
+            return None
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_OPENER = urllib.request.build_opener(SameHostRedirectHandler)
+
+
+def open_url(request, timeout):
+    return _OPENER.open(request, timeout=timeout)
 
 
 def http_request(
@@ -45,7 +86,7 @@ def http_request(
     )
 
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with open_url(request, timeout=timeout) as response:
             status = response.getcode()
             raw = response.read()
             if isinstance(raw, bytes):
@@ -74,6 +115,16 @@ def http_error(label: str, status: int, text: str) -> Exception:
     if status == 0:
         return Exception(f"{label}: could not connect ({text})")
     return Exception(f"{label}: {status}")
+
+
+def safe_child(root: Path, name: str) -> Path:
+    if Path(name).is_absolute():
+        raise ValueError(f"refusing to write outside {root}: {name!r}")
+    root_resolved = root.resolve()
+    resolved = (root / name).resolve()
+    if resolved == root_resolved or not resolved.is_relative_to(root_resolved):
+        raise ValueError(f"refusing to write outside {root}: {name!r}")
+    return resolved
 
 
 @dataclass
@@ -162,25 +213,47 @@ class MCMEngine:
 
             mcp = {"original": line, "type": "unknown", "identifier": line}
 
-            # GitHub URL
             if "github.com" in line:
-                mcp["type"] = "github_url"
-                mcp["identifier"] = line.split("github.com/")[-1].rstrip("/")
-            # NPM package
-            elif line.startswith("@") or "/" not in line:
-                if line.startswith("@modelcontextprotocol/"):
-                    mcp["type"] = "npm_official"
-                    mcp["identifier"] = line
-                    mcp["name"] = line.replace("@modelcontextprotocol/server-", "")
+                match = GITHUB_URL.fullmatch(line)
+                if match:
+                    owner = match.group(1)
+                    repo = match.group(2)
+                    if repo.endswith(".git"):
+                        repo = repo[:-4]
+                    if (not repo) or repo in (".", ".."):
+                        mcp["type"] = "invalid"
+                        mcp["reason"] = (
+                            "not a GitHub repository URL (https://github.com/owner/repo)"
+                        )
+                    else:
+                        mcp["type"] = "github_url"
+                        mcp["identifier"] = owner + "/" + repo
                 else:
-                    mcp["type"] = "npm_package"
-                    mcp["identifier"] = line
-                    mcp["name"] = line.split("/")[-1]
-            # Simple name
-            else:
-                mcp["type"] = "name"
+                    mcp["type"] = "invalid"
+                    mcp["reason"] = (
+                        "not a GitHub repository URL (https://github.com/owner/repo)"
+                    )
+            elif (
+                line.startswith("@modelcontextprotocol/")
+                and NPM_NAME.fullmatch(line)
+                and len(line) <= 214
+            ):
+                mcp["type"] = "npm_official"
                 mcp["identifier"] = line
-                mcp["name"] = line
+                mcp["name"] = line.replace("@modelcontextprotocol/server-", "")
+            elif (
+                NPM_NAME.fullmatch(line)
+                and len(line) <= 214
+                and (line.startswith("@") or "/" not in line)
+            ):
+                mcp["type"] = "npm_package"
+                mcp["identifier"] = line
+                mcp["name"] = line.split("/")[-1]
+            else:
+                mcp["type"] = "invalid"
+                mcp["reason"] = (
+                    "not an npm package name, a GitHub repository URL or a plain name"
+                )
 
             mcps.append(mcp)
 
@@ -188,6 +261,14 @@ class MCMEngine:
 
     def discover_mcp(self, mcp_info: Dict) -> Optional[MCPMetadata]:
         """Discover and analyze a single MCP"""
+        if mcp_info["type"] == "invalid":
+            original = mcp_info.get("original", mcp_info.get("identifier", ""))
+            self.log(
+                f"Skipped {original!r}: {mcp_info['reason']}",
+                "warning",
+            )
+            return None
+
         self.log(f"Discovering: {mcp_info['identifier']}", "info")
 
         try:
@@ -197,8 +278,12 @@ class MCMEngine:
             elif mcp_info["type"] in ["npm_official", "npm_package"]:
                 return self.discover_from_npm(mcp_info)
             else:
-                # Try Exa.ai search
-                return self.discover_via_search(mcp_info)
+                original = mcp_info.get("original", mcp_info.get("identifier", ""))
+                self.log(
+                    f"Skipped {original!r}: not an npm package name or a GitHub repository URL",
+                    "warning",
+                )
+                return None
 
         except Exception as e:
             self.log(f"Discovery failed for {mcp_info['identifier']}: {str(e)}", "error")
@@ -207,12 +292,22 @@ class MCMEngine:
     def discover_from_github(self, mcp_info: Dict) -> Optional[MCPMetadata]:
         """Discover MCP from GitHub repository"""
         repo_path = mcp_info["identifier"]
+        if (
+            GITHUB_REPO.fullmatch(repo_path) is None
+            or repo_path.endswith("/.")
+            or repo_path.endswith("/..")
+        ):
+            raise Exception(f"not a GitHub repository: {repo_path!r}")
+
         api_url = f"https://api.github.com/repos/{repo_path}"
 
         # Get repo info
         headers = {}
         if github_token := os.getenv("GITHUB_TOKEN"):
             headers["Authorization"] = f"token {github_token}"
+
+        token_note = " (with your GITHUB_TOKEN)" if github_token else ""
+        print(f"  → api.github.com: {repo_path}{token_note}")
 
         status, text = http_request("GET", api_url, headers=headers)
         if status != 200:
@@ -259,6 +354,7 @@ class MCMEngine:
         package_name = mcp_info["identifier"]
         npm_url = f"https://registry.npmjs.org/{package_name}"
 
+        print(f"  → registry.npmjs.org: {package_name}")
         status, text = http_request("GET", npm_url)
         if status != 200:
             raise http_error("NPM registry error", status, text)
@@ -297,44 +393,6 @@ class MCMEngine:
 
         return metadata
 
-    def discover_via_search(self, mcp_info: Dict) -> Optional[MCPMetadata]:
-        """Discover MCP using Exa.ai search"""
-        query = f"model context protocol MCP {mcp_info['identifier']} server"
-
-        if not EXA_API_KEY:
-            self.log("EXA_API_KEY not set, falling back to basic search", "warning")
-            return None
-
-        headers = {
-            "Content-Type": "application/json",
-            "x-api-key": EXA_API_KEY
-        }
-
-        data = {
-            "query": query,
-            "numResults": 3,
-            "useAutoprompt": True,
-            "type": "neural"
-        }
-
-        status, text = http_request(
-            "POST", "https://api.exa.ai/search", headers=headers, json_body=data
-        )
-        if status != 200:
-            raise http_error("Exa.ai API error", status, text)
-
-        results = json.loads(text).get("results", [])
-
-        # Try to find GitHub repo in results
-        for result in results:
-            url = result.get("url", "")
-            if "github.com" in url:
-                github_path = url.split("github.com/")[-1].split("/")[0:2]
-                github_path = "/".join(github_path)
-                return self.discover_from_github({"identifier": github_path, "type": "github_url"})
-
-        return None
-
     def analyze_mcp_tools(self, repo_path: str, headers: Dict) -> List[Dict]:
         """Analyze MCP repository to extract tool definitions"""
         # This is a simplified version - would need more sophisticated analysis
@@ -350,6 +408,7 @@ class MCMEngine:
             "server.js"
         ]
 
+        print(f"  → raw.githubusercontent.com: {repo_path} source files")
         for file_path in possible_files:
             url = f"https://raw.githubusercontent.com/{repo_path}/main/{file_path}"
             try:
@@ -428,7 +487,7 @@ class MCMEngine:
 
     def save_metadata(self, metadata: MCPMetadata):
         """Save MCP metadata to registry"""
-        registry_dir = self.mcm_home / "registry" / metadata.name
+        registry_dir = safe_child(self.mcm_home / "registry", metadata.name)
         registry_dir.mkdir(parents=True, exist_ok=True)
 
         metadata_file = registry_dir / "metadata.json"

@@ -121,11 +121,21 @@ Results land in `~/.mcm/registry/index.json`. `bash ~/.claude/scripts/mcm/main.s
 
 1. `/mcm` commands invoke local shell scripts
 2. Scripts call a Python analysis engine
-3. MCP metadata is fetched from GitHub, npm, or Exa.ai (if configured)
+3. MCP metadata is fetched from npm and GitHub
 4. Tool summaries and indexes are written to `~/.mcm/`
 5. Claude references structured summaries instead of raw schemas
 
 This moves MCP reasoning from **prompt-time → offline-time**.
+
+---
+
+## What MCM sends
+
+* discover sends each name you give it to registry.npmjs.org. For a package whose repository is on GitHub, it sends the owner/repo to api.github.com (with GITHUB_TOKEN if you set it) and reads source files from raw.githubusercontent.com.
+* MCM uses no search service. The only key it reads is GITHUB_TOKEN, and only for api.github.com.
+* Nothing else leaves your machine: no file contents, no paths and no config. Each request is printed as it happens.
+* A name must look like an npm package, a GitHub repository URL or a plain name; anything else is skipped and nothing is sent for it.
+* A redirect to another host is refused, so a token or key never follows one.
 
 ---
 
