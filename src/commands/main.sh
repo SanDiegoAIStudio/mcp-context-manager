@@ -97,6 +97,9 @@ case "${1:-help}" in
     discover)
         exec "$SCRIPT_DIR/discover.sh" "${@:2}"
         ;;
+    inspect)
+        exec python3 "$SCRIPT_DIR/mcm_engine.py" inspect "${@:2}"
+        ;;
     status)
         exec "$SCRIPT_DIR/status.sh" "${@:2}"
         ;;
@@ -111,14 +114,16 @@ Usage: mcm <command> [options]
 
 ${BOLD}Commands:${NC}
   discover        Discover and optimize MCPs (first-time setup)
-  status          Show loaded tools and context usage
-  validate        Test all MCPs
+  inspect <pkg>   Start a server outside the conversation and list its tools
+  status          Show saved servers and inspected tool counts
+  validate        List what MCM has saved
   help            Show this help message
 
 ${BOLD}Examples:${NC}
   mcm discover
   mcm status
   mcm validate
+  mcm inspect @modelcontextprotocol/server-filesystem -- /tmp
 
 ${BOLD}Documentation:${NC}
   Full docs: cat ~/.claude/commands/mcm.md

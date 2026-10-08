@@ -8,8 +8,13 @@ import os
 import sys
 import json
 import re
-import subprocess
+import queue
+import shutil
+import signal
 import socket
+import subprocess
+import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -17,7 +22,7 @@ import urllib.request
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, asdict
-from datetime import datetime
+from datetime import datetime, timezone
 import hashlib
 
 # Configuration
@@ -32,6 +37,10 @@ GITHUB_URL = re.compile(
 GITHUB_REPO = re.compile(
     r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}"
 )
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(tzinfo=None).isoformat() + "Z"
 
 
 class SameHostRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -147,6 +156,8 @@ class MCPMetadata:
     credentials_needed: List[Dict]
     discovered_at: str
     format: str  # 'progressive', 'cli', 'skill', 'direct'
+    inspected: bool = False
+    inspected_at: str = ""
 
 class MCMEngine:
     """Core MCM engine for MCP management"""
@@ -185,13 +196,13 @@ class MCMEngine:
     def save_config(self):
         """Save MCM configuration"""
         config_file = self.mcm_home / "config" / "mcm-config.json"
-        self.config["updated_at"] = datetime.utcnow().isoformat() + "Z"
+        self.config["updated_at"] = utc_now_iso()
         with open(config_file, "w") as f:
             json.dump(self.config, f, indent=2)
 
     def log(self, message: str, level: str = "info"):
         """Log message to file and console"""
-        timestamp = datetime.utcnow().isoformat()
+        timestamp = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
         log_file = self.mcm_home / "logs" / f"{level}.log"
 
         with open(log_file, "a") as f:
@@ -346,7 +357,7 @@ class MCMEngine:
             context_cost_estimate=0,
             dependencies=list(package_json.get("dependencies", {}).keys()) if package_json else [],
             credentials_needed=self.detect_credentials([]),
-            discovered_at=datetime.utcnow().isoformat() + "Z",
+            discovered_at=utc_now_iso(),
             format="direct"
         )
 
@@ -376,7 +387,12 @@ class MCMEngine:
         # If GitHub repo, analyze it
         if "github.com" in repo_url:
             github_path = repo_url.split("github.com/")[-1]
-            return self.discover_from_github({"identifier": github_path, "type": "github_url"})
+            metadata = self.discover_from_github(
+                {"identifier": github_path, "type": "github_url"}
+            )
+            if metadata is not None:
+                metadata.name = package_name
+            return metadata
 
         # Otherwise create basic metadata
         metadata = MCPMetadata(
@@ -390,7 +406,7 @@ class MCMEngine:
             context_cost_estimate=0,
             dependencies=list(latest_data.get("dependencies", {}).keys()),
             credentials_needed=[],
-            discovered_at=datetime.utcnow().isoformat() + "Z",
+            discovered_at=utc_now_iso(),
             format="direct"
         )
 
@@ -451,36 +467,401 @@ class MCMEngine:
 
     def save_metadata(self, metadata: MCPMetadata):
         """Save MCP metadata to registry"""
-        registry_dir = safe_child(self.mcm_home / "registry", metadata.name)
-        registry_dir.mkdir(parents=True, exist_ok=True)
-
-        metadata_file = registry_dir / "metadata.json"
-        with open(metadata_file, "w") as f:
-            json.dump(asdict(metadata), f, indent=2)
-
-        # Update index
-        index_file = self.mcm_home / "registry" / "index.json"
+        registry_root = self.mcm_home / "registry"
+        index_file = registry_root / "index.json"
         if index_file.exists():
             with open(index_file) as f:
                 index = json.load(f)
         else:
             index = {"mcps": [], "updated_at": ""}
 
-        # Add or update
+        existing_entry = None
+        for item in index.get("mcps", []):
+            if item.get("name") == metadata.name:
+                existing_entry = item
+                break
+
+        keep_inspected = (
+            (not metadata.inspected)
+            and existing_entry is not None
+            and bool(existing_entry.get("inspected"))
+        )
+
+        if keep_inspected:
+            entry = dict(existing_entry)
+            entry["name"] = metadata.name
+            entry["source"] = metadata.source
+            entry["discovered_at"] = metadata.discovered_at
+        else:
+            registry_dir = safe_child(registry_root, metadata.name)
+            registry_dir.mkdir(parents=True, exist_ok=True)
+
+            metadata_file = registry_dir / "metadata.json"
+            with open(metadata_file, "w") as f:
+                json.dump(asdict(metadata), f, indent=2)
+
+            entry = {
+                "name": metadata.name,
+                "source": metadata.source,
+                "tool_count": metadata.tool_count,
+                "format": metadata.format,
+                "discovered_at": metadata.discovered_at,
+                "inspected": bool(metadata.inspected),
+            }
+            if metadata.inspected:
+                entry["context_tokens"] = metadata.context_cost_estimate
+
         existing = [m for m in index["mcps"] if m["name"] != metadata.name]
-        existing.append({
-            "name": metadata.name,
-            "source": metadata.source,
-            "tool_count": metadata.tool_count,
-            "format": metadata.format,
-            "discovered_at": metadata.discovered_at
-        })
+        existing.append(entry)
 
         index["mcps"] = existing
-        index["updated_at"] = datetime.utcnow().isoformat() + "Z"
+        index["updated_at"] = utc_now_iso()
 
         with open(index_file, "w") as f:
             json.dump(index, f, indent=2)
+
+
+class InspectError(Exception):
+    pass
+
+
+INSPECT_TIMEOUT = 30
+
+_INSPECT_ENV_KEYS = ("PATH", "HOME", "USER", "LANG", "TMPDIR")
+_MAX_TOOL_PAGES = 20
+
+
+def _strip_controls(text: str) -> str:
+    kept = []
+    for ch in text:
+        code = ord(ch)
+        if code < 32 or code == 127:
+            continue
+        kept.append(ch)
+    return "".join(kept)
+
+
+def _inspect_env() -> Dict[str, str]:
+    env = {}  # type: Dict[str, str]
+    for key in _INSPECT_ENV_KEYS:
+        if key in os.environ:
+            env[key] = os.environ[key]
+    return env
+
+
+def _read_stderr_tail(path: str) -> str:
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read()
+    except OSError:
+        return ""
+    return data.decode("utf-8", errors="replace")
+
+
+def _stop_inspect_process(proc):
+    if proc is None:
+        return
+    try:
+        if proc.stdin is not None and not proc.stdin.closed:
+            proc.stdin.close()
+    except OSError:
+        pass
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        pass
+    try:
+        proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def _context_tokens(raw_tools: List) -> int:
+    total = 0
+    for entry in raw_tools:
+        total += len(json.dumps(entry, sort_keys=True, separators=(",", ":")))
+    return total // 4
+
+
+def _clean_tools(raw_tools: List) -> List[Dict]:
+    cleaned = []  # type: List[Dict]
+    for entry in raw_tools:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        if not isinstance(name, str) or name == "":
+            continue
+        name = _strip_controls(name)
+        description = entry.get("description", "")
+        if not isinstance(description, str):
+            description = ""
+        description = _strip_controls(description)[:200]
+        if "inputSchema" not in entry or entry.get("inputSchema") is None:
+            schema_size = 0
+        else:
+            schema_size = len(
+                json.dumps(
+                    entry["inputSchema"], sort_keys=True, separators=(",", ":")
+                )
+            )
+        cleaned.append(
+            {
+                "name": name,
+                "description": description,
+                "schema_size": schema_size,
+            }
+        )
+    return cleaned
+
+
+def inspect_command(
+    command: List[str], timeout: float = INSPECT_TIMEOUT
+) -> Tuple[List[Dict], int]:
+    """Start one MCP server and collect its tool names over stdio."""
+    work = tempfile.TemporaryDirectory(prefix="mcm-inspect-")
+    proc = None
+    stderr_fh = None
+    try:
+        stderr_path = os.path.join(work.name, "stderr.txt")
+        stderr_fh = open(stderr_path, "wb")
+        proc = subprocess.Popen(
+            command,
+            cwd=work.name,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=stderr_fh,
+            env=_inspect_env(),
+            start_new_session=True,
+        )
+        try:
+            return _inspect_exchange(proc, stderr_path, timeout)
+        finally:
+            _stop_inspect_process(proc)
+            proc = None
+    finally:
+        if proc is not None:
+            _stop_inspect_process(proc)
+        if stderr_fh is not None:
+            try:
+                stderr_fh.close()
+            except OSError:
+                pass
+        work.cleanup()
+
+
+def _inspect_exchange(proc, stderr_path: str, timeout: float) -> Tuple[List[Dict], int]:
+    line_queue = queue.Queue()  # type: queue.Queue
+
+    def reader():
+        try:
+            while True:
+                line = proc.stdout.readline()
+                if line == b"":
+                    break
+                line_queue.put(line)
+        except Exception:
+            pass
+        finally:
+            line_queue.put(None)
+
+    thread = threading.Thread(target=reader, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + timeout
+
+    def timed_out():
+        raise InspectError(
+            "the server did not answer within %g seconds; it was stopped" % timeout
+        )
+
+    def exited():
+        code = proc.poll()
+        if code is None:
+            try:
+                code = proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                code = proc.poll()
+        if code is None:
+            code = -1
+        message = "the server exited before answering (exit code %s)" % code
+        err = _read_stderr_tail(stderr_path)
+        if err:
+            message += " | " + err[-500:]
+        raise InspectError(message)
+
+    def send(payload: Dict):
+        if time.monotonic() >= deadline:
+            timed_out()
+        if proc.poll() is not None:
+            exited()
+        data = (json.dumps(payload) + "\n").encode("utf-8")
+        try:
+            proc.stdin.write(data)
+            proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            exited()
+
+    def wait_response(expected_id, method: str):
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out()
+            try:
+                line = line_queue.get(timeout=remaining)
+            except queue.Empty:
+                timed_out()
+            if line is None:
+                exited()
+            text = line.decode("utf-8", errors="replace").strip()
+            if text == "":
+                continue
+            try:
+                message = json.loads(text)
+            except ValueError:
+                raise InspectError("the server wrote a line that is not JSON-RPC")
+            if not isinstance(message, dict):
+                continue
+            if message.get("id") != expected_id:
+                continue
+            error = message.get("error")
+            if error is not None:
+                if not isinstance(error, dict):
+                    error = {}
+                raise InspectError(
+                    "the server answered %s with an error: %s"
+                    % (method, error.get("message", ""))
+                )
+            return message.get("result")
+
+    send(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "mcp-context-manager",
+                    "version": "1.0.0",
+                },
+            },
+        }
+    )
+    wait_response(1, "initialize")
+    send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+
+    raw_tools = []  # type: List
+    cursor = None
+    next_id = 2
+    for _page in range(_MAX_TOOL_PAGES):
+        if cursor is None:
+            params = {}  # type: Dict
+        else:
+            params = {"cursor": cursor}
+        send(
+            {
+                "jsonrpc": "2.0",
+                "id": next_id,
+                "method": "tools/list",
+                "params": params,
+            }
+        )
+        result = wait_response(next_id, "tools/list")
+        next_id += 1
+        if not isinstance(result, dict) or not isinstance(result.get("tools"), list):
+            raise InspectError("the server's tools/list answer has no tools list")
+        raw_tools.extend(result["tools"])
+        cursor = result.get("nextCursor")
+        if not isinstance(cursor, str):
+            break
+
+    return (_clean_tools(raw_tools), _context_tokens(raw_tools))
+
+
+def _cmd_inspect(engine: "MCMEngine"):
+    if len(sys.argv) < 3 or sys.argv[2].startswith("-"):
+        print(
+            "Usage: mcm_engine.py inspect <package> [--yes] [-- <server args>...]"
+        )
+        sys.exit(1)
+
+    package = sys.argv[2]
+    rest = sys.argv[3:]
+    yes = False
+    if rest and rest[0] == "--yes":
+        yes = True
+        rest = rest[1:]
+    server_args = []  # type: List[str]
+    if rest and rest[0] == "--":
+        server_args = rest[1:]
+        rest = []
+    if rest:
+        print(
+            "Usage: mcm_engine.py inspect <package> [--yes] [-- <server args>...]"
+        )
+        sys.exit(1)
+
+    if NPM_NAME.fullmatch(package) is None or len(package) > 214:
+        print(f"Error: not an npm package name: {package!r}")
+        sys.exit(1)
+
+    if shutil.which("npx") is None:
+        print("Error: npx was not found. Install Node.js, then try again.")
+        sys.exit(1)
+
+    print(
+        f"This runs {package}'s own code on your machine, the same as installing it."
+    )
+    if not yes:
+        if not sys.stdin.isatty():
+            print("Not started. Run it again with --yes to continue.")
+            sys.exit(1)
+        answer = input("Continue? (y/n) ")
+        if answer.strip().lower() not in ("y", "yes"):
+            print("Not started.")
+            sys.exit(1)
+
+    print(
+        f"Starting npx -y {package} in a temporary folder; it is stopped after {INSPECT_TIMEOUT} seconds."
+    )
+    try:
+        tools, context_tokens = inspect_command(
+            ["npx", "-y", package] + server_args
+        )
+    except InspectError as exc:
+        print(f"Error: {exc}")
+        sys.exit(1)
+
+    now = utc_now_iso()
+    metadata = MCPMetadata(
+        name=package,
+        source="npm",
+        url=f"https://www.npmjs.com/package/{package}",
+        description="",
+        tools=tools,
+        tool_count=len(tools),
+        complexity_score=float(len(tools)),
+        context_cost_estimate=context_tokens,
+        dependencies=[],
+        credentials_needed=[],
+        discovered_at=now,
+        format=engine.determine_optimal_format(tools),
+        inspected=True,
+        inspected_at=now,
+    )
+    engine.save_metadata(metadata)
+    print(
+        f"{package}: {len(tools)} tools, about {context_tokens} tokens of tool definitions"
+    )
+    for tool in tools:
+        print(f"  - {tool['name']} (schema {tool['schema_size']} characters)")
 
 
 def scan_claude_config(project_dir: Path, home: Path) -> Tuple[List[str], List[str]]:
@@ -589,7 +970,16 @@ def main():
                 except (ValueError, OSError) as exc:
                     print(f"  ✗ {metadata.name}: not saved ({exc})")
                 else:
-                    print(f"  ✓ {metadata.name}: saved")
+                    from_npm = metadata.source == "npm" or mcp_info.get("type") in (
+                        "npm_package",
+                        "npm_official",
+                    )
+                    if from_npm:
+                        print(
+                            f"  ✓ {metadata.name}: saved; tools not inspected (run: mcm inspect {metadata.name})"
+                        )
+                    else:
+                        print(f"  ✓ {metadata.name}: saved; tools not inspected")
                     ok += 1
             else:
                 print(f"  ✗ Failed to discover")
@@ -599,6 +989,9 @@ def main():
         print(f"Discovered {ok} of {len(mcps)}")
         if len(mcps) > 0 and ok == 0:
             sys.exit(1)
+
+    elif command == "inspect":
+        _cmd_inspect(engine)
 
     elif command == "scan-config":
         packages, skipped = scan_claude_config(Path.cwd(), Path.home())
