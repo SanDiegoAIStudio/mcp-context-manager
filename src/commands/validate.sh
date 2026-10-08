@@ -15,8 +15,16 @@ python3 - "$MCM_HOME/registry/index.json" <<'PY'
 import json
 import sys
 
-with open(sys.argv[1]) as handle:
-    data = json.load(handle)
+path = sys.argv[1]
+try:
+    with open(path) as handle:
+        data = json.load(handle)
+except json.JSONDecodeError:
+    print(
+        "The registry index is not valid JSON: %s. Move it aside and run discover again."
+        % path
+    )
+    sys.exit(1)
 
 for mcp in data.get("mcps", []):
     name = mcp.get("name", "")
@@ -25,6 +33,9 @@ for mcp in data.get("mcps", []):
     else:
         print("· %s: not inspected (run: mcm inspect %s)" % (name, name))
 PY
+if [[ $? -ne 0 ]]; then
+    exit 1
+fi
 
 echo ""
 echo "validate lists what MCM has saved. It does not start servers; mcm inspect does."

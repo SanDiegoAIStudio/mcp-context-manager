@@ -7,7 +7,17 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MCM_HOME="${MCM_HOME:-$HOME/.mcm}"
-ENGINE="$SCRIPT_DIR/mcm_engine.py"
+THIS_SCRIPT="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
+
+# Installed copies keep the engine beside this script. A clone keeps it in src/.
+if [[ -f "$SCRIPT_DIR/mcm_engine.py" ]]; then
+    ENGINE="$SCRIPT_DIR/mcm_engine.py"
+elif [[ -f "$SCRIPT_DIR/../mcm_engine.py" ]]; then
+    ENGINE="$SCRIPT_DIR/../mcm_engine.py"
+else
+    printf 'Error: mcm_engine.py was not found next to %s or one folder up.\n' "$THIS_SCRIPT" >&2
+    exit 1
+fi
 
 # Colors
 GREEN=$'\033[0;32m'
@@ -32,6 +42,7 @@ fi
 
 mkdir -p "$MCM_HOME/cache"
 MCP_INPUT_FILE="$MCM_HOME/cache/mcp-input-$$.txt"
+trap 'rm -f "$MCP_INPUT_FILE"' EXIT
 
 if [[ $# -gt 0 ]]; then
     printf '%s\n' "$@" > "$MCP_INPUT_FILE"
@@ -67,7 +78,6 @@ else
 
             if [[ ! -s "$MCP_INPUT_FILE" ]]; then
                 echo "No MCP servers found in ./.mcp.json or ~/.claude.json"
-                rm -f "$MCP_INPUT_FILE"
                 exit 1
             fi
 
@@ -103,7 +113,6 @@ done < "$MCP_INPUT_FILE"
 
 if [[ "$has_name" -eq 0 ]]; then
     echo "No MCP names given. Example: mcm discover @modelcontextprotocol/server-filesystem"
-    rm -f "$MCP_INPUT_FILE"
     exit 1
 fi
 
@@ -111,20 +120,27 @@ echo ""
 echo -e "${BOLD}🚀 Starting MCP discovery...${NC}"
 echo ""
 
-# Run discovery
-if python3 "$ENGINE" discover "$MCP_INPUT_FILE"; then
-    rm -f "$MCP_INPUT_FILE"
+# Run discovery. 0: every name saved. 2: some saved and some not. Anything else: none.
+discover_status=0
+python3 "$ENGINE" discover "$MCP_INPUT_FILE" || discover_status=$?
 
+if [[ "$discover_status" -eq 0 ]]; then
     echo ""
     echo -e "${GREEN}✅ Discovery complete!${NC}"
     echo ""
     echo "Next steps:"
     echo "1. Review: cat $MCM_HOME/registry/index.json"
-    echo "2. Configure credentials: edit $MCM_HOME/config/credentials.env"
-    echo "3. Validate: mcm validate"
+    echo "2. Validate: mcm validate"
     echo ""
+elif [[ "$discover_status" -eq 2 ]]; then
+    echo "Discovery finished with failures. See the lines marked ✗ above."
+    echo ""
+    echo "Next steps:"
+    echo "1. Review: cat $MCM_HOME/registry/index.json"
+    echo "2. Validate: mcm validate"
+    echo ""
+    exit 2
 else
-    rm -f "$MCP_INPUT_FILE"
     echo "Discovery failed: no MCP could be read. See the errors above."
     exit 1
 fi
