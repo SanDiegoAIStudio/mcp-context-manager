@@ -107,26 +107,43 @@ In **Claude Code**, type:
 Paste MCP names, packages, or URLs (any format).
 MCM will analyze them and store results locally.
 
+From a terminal:
+
+```bash
+bash ~/.claude/scripts/mcm/main.sh discover @modelcontextprotocol/server-filesystem
+```
+
+Results land in `~/.mcm/registry/index.json`. `bash ~/.claude/scripts/mcm/main.sh status` lists them.
+
 ---
 
 ## 📊 How It Works (High Level)
 
 1. `/mcm` commands invoke local shell scripts
 2. Scripts call a Python analysis engine
-3. MCP metadata is fetched from GitHub, npm, or Exa.ai (if configured)
-4. Tool summaries and indexes are written to `~/.mcm/`
+3. MCP metadata is fetched from npm and GitHub
+4. Package and repository details are written to `~/.mcm/`
 5. Claude references structured summaries instead of raw schemas
 
 This moves MCP reasoning from **prompt-time → offline-time**.
 
 ---
 
-## Known limits (measured 2026-10-06)
+## What MCM sends
 
-- The engine imports the `requests` package. The installer tries `pip install --user requests`, which many current system Pythons refuse, so discovery can stop with "No module named 'requests'".
-- The installer writes `~/.mcm/config/mcm-config.json` with invalid JSON, so discovery stops with a JSON error even where `requests` is installed.
-- `/mcm discover` asks its questions in an interactive menu, which Claude Code's shell cannot answer.
-- The slash command lists `search`, `reload`, `optimize`, `stats` and `config`, which have no scripts.
+* discover sends each name you give it to registry.npmjs.org. For a package whose repository is on GitHub, it sends the owner/repo to api.github.com (with GITHUB_TOKEN if you set it) and reads the repository's package.json from raw.githubusercontent.com.
+* MCM uses no search service. The only key it reads is GITHUB_TOKEN, and only for api.github.com.
+* Nothing else leaves your machine: no file contents, no paths and no config. Each request is printed as it happens.
+* A name must look like an npm package, a GitHub repository URL or a plain name; anything else is skipped and nothing is sent for it.
+* A redirect to another host is refused, so a token or key never follows one.
+
+---
+
+## Known limits
+
+- discover saves a server's package and repository details, not its tools. Tool counts are not read yet.
+
+---
 
 ## ⚠️ Project Status
 
@@ -149,6 +166,14 @@ These are ideas, not current features:
 * Usage-based MCP recommendations
 * Improved schema parsing (AST-based)
 * Host-integrated tool loading (if supported in the future)
+
+---
+
+## Tests
+
+```bash
+python3 -m unittest discover -s tests -v
+```
 
 ---
 
