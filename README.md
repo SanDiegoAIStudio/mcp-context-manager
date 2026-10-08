@@ -89,10 +89,12 @@ Even without runtime control, this improves **clarity, confidence, and workflow 
 ### Installation
 
 ```bash
-git clone https://github.com/Lucface/mcp-context-manager.git
+git clone https://github.com/SanDiegoAIStudio/mcp-context-manager.git
 cd mcp-context-manager
 ./install.sh
 ```
+
+The installer copies the `/mcm` slash command to `~/.claude/commands/mcm.md`, the scripts to `~/.claude/scripts/mcm/`, and creates the workspace at `~/.mcm/`.
 
 ### Discover MCPs
 
@@ -118,6 +120,13 @@ MCM will analyze them and store results locally.
 This moves MCP reasoning from **prompt-time → offline-time**.
 
 ---
+
+## Known limits (measured 2026-10-06)
+
+- The engine imports the `requests` package. The installer tries `pip install --user requests`, which many current system Pythons refuse, so discovery can stop with "No module named 'requests'".
+- The installer writes `~/.mcm/config/mcm-config.json` with invalid JSON, so discovery stops with a JSON error even where `requests` is installed.
+- `/mcm discover` asks its questions in an interactive menu, which Claude Code's shell cannot answer.
+- The slash command lists `search`, `reload`, `optimize`, `stats` and `config`, which have no scripts.
 
 ## ⚠️ Project Status
 
