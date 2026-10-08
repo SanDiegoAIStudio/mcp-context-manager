@@ -2978,6 +2978,77 @@ class InspectTests(IsolatedHomeTest):
             proc.stdout,
         )
 
+    def test_proxy_value_withheld_when_value_contains_at(self):
+        """source: a proxy address with credentials was parsed as a scheme and passed to the server"""
+        engine_mod = load_engine(self.mcm_home)
+        user = "user"
+        password = "pw"
+        host = "proxy.example.test:8080"
+        with_scheme = "http://%s:%s@%s" % (user, password, host)
+        without_scheme = "%s:%s@%s" % (user, password, host)
+        bypass = "%s:%s@host:8080/?r=http://x" % (user, password)
+        self.assertTrue(engine_mod._proxy_value_withheld(with_scheme))
+        self.assertTrue(engine_mod._proxy_value_withheld(without_scheme))
+        self.assertTrue(engine_mod._proxy_value_withheld(bypass))
+        self.assertFalse(
+            engine_mod._proxy_value_withheld("http://proxy.example.test:8080")
+        )
+        self.assertFalse(
+            engine_mod._proxy_value_withheld("proxy.example.test:8080")
+        )
+        self.assertFalse(
+            engine_mod._proxy_value_withheld("socks5://proxy.example.test:1080")
+        )
+
+    def test_inspect_env_withholds_proxy_bypass_value(self):
+        """source: a proxy address with credentials after a question mark was passed to the server"""
+        engine_mod = load_engine(self.mcm_home)
+        note = (
+            "a proxy setting that holds a user name or password was not passed to the server"
+        )
+        keys = (
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        )
+        saved = {}
+        for key in keys:
+            saved[key] = os.environ.get(key)
+        user = "user"
+        password = "pw"
+        bypass = "%s:%s@host:8080/?r=http://x" % (user, password)
+        report = self.tmp / "env-bypass.json"
+        notes = []
+        try:
+            for key in keys:
+                os.environ.pop(key, None)
+            os.environ["HTTPS_PROXY"] = bypass
+            if report.exists():
+                report.unlink()
+            try:
+                engine_mod.inspect_command(
+                    [sys.executable, FAKE, "env", str(report)],
+                    timeout=10,
+                    notes=notes,
+                )
+            except Exception as exc:
+                self.fail("env mode inspect raised: %s" % exc)
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+        try:
+            info = json.loads(report.read_text())
+        except Exception as exc:
+            self.fail("env report is not valid JSON: %r" % (exc,))
+        self.assertNotIn("HTTPS_PROXY", info["keys"])
+        self.assertIn(note, notes)
+
     def test_inspect_timeout_says_to_run_again(self):
         """source: a timeout during the first download gave no hint to run it again"""
         engine_mod = load_engine(self.mcm_home)
@@ -3555,45 +3626,177 @@ class RegistryIndexTests(IsolatedHomeTest):
             self.assertNotIn("nan", matches[0].lower())
             self.assertNotIn("1 tools", matches[0])
 
+    def _build_metadata(self, engine_mod, name, **overrides):
+        fields = {
+            "name": name,
+            "source": "npm",
+            "url": "https://www.npmjs.com/package/" + name,
+            "description": "saved description",
+            "tools": [],
+            "tool_count": 0,
+            "complexity_score": 0.0,
+            "context_cost_estimate": 0,
+            "dependencies": ["kept"],
+            "credentials_needed": [],
+            "discovered_at": "2020-01-01T00:00:00Z",
+            "format": "direct",
+        }
+        fields.update(overrides)
+        return engine_mod.MCPMetadata(**fields)
+
+    def _read_saved_metadata(self, name):
+        path = self.mcm_home / "registry" / name / "metadata.json"
+        try:
+            return json.loads(path.read_text())
+        except Exception as exc:
+            self.fail("saved metadata is not valid JSON: %r" % (exc,))
+
+    def test_rediscover_empty_dependencies_replace_saved_list(self):
+        """source: a re-discovered package kept dependencies that npm no longer lists"""
+        engine_mod = load_engine(self.mcm_home)
+        engine = engine_mod.MCMEngine()
+        try:
+            engine.save_metadata(
+                self._build_metadata(
+                    engine_mod,
+                    "deps-mcp",
+                    dependencies=["zod"],
+                    description="had deps",
+                )
+            )
+            engine.save_metadata(
+                self._build_metadata(
+                    engine_mod,
+                    "deps-mcp",
+                    dependencies=[],
+                    description="no deps",
+                    discovered_at="2021-01-01T00:00:00Z",
+                )
+            )
+        except Exception as exc:
+            self.fail("save_metadata raised %r" % (exc,))
+        saved = self._read_saved_metadata("deps-mcp")
+        self.assertEqual(saved["dependencies"], [])
+        self.assertEqual(saved["description"], "no deps")
+        self.assertEqual(saved["discovered_at"], "2021-01-01T00:00:00Z")
+
+    def test_inspect_after_discover_keeps_url_and_description(self):
+        """source: an inspected record with url None and an empty description replaced the url and description discover had saved"""
+        engine_mod = load_engine(self.mcm_home)
+        engine = engine_mod.MCMEngine()
+        discover_url = "https://www.npmjs.com/package/kept-mcp"
+        discover_description = "from npm"
+        tools = [{"name": "read_file", "description": "", "schema_size": 1}]
+        try:
+            engine.save_metadata(
+                self._build_metadata(
+                    engine_mod,
+                    "kept-mcp",
+                    url=discover_url,
+                    description=discover_description,
+                    dependencies=["zod"],
+                )
+            )
+            engine.save_metadata(
+                self._build_metadata(
+                    engine_mod,
+                    "kept-mcp",
+                    url=None,
+                    description="",
+                    dependencies=[],
+                    credentials_needed=[],
+                    tools=tools,
+                    tool_count=1,
+                    complexity_score=1.0,
+                    context_cost_estimate=180,
+                    format="cli",
+                    inspected=True,
+                    inspected_at="2020-02-01T00:00:00Z",
+                )
+            )
+        except Exception as exc:
+            self.fail("save_metadata raised %r" % (exc,))
+        saved = self._read_saved_metadata("kept-mcp")
+        self.assertEqual(saved["url"], discover_url)
+        self.assertEqual(saved["description"], discover_description)
+        self.assertEqual(saved["dependencies"], ["zod"])
+        self.assertEqual(saved["tools"], tools)
+        self.assertTrue(saved["inspected"])
+
+    def test_discover_after_inspect_keeps_tools_and_empty_description(self):
+        """source: a discover with an empty description after an inspect kept the saved description or dropped the tools"""
+        engine_mod = load_engine(self.mcm_home)
+        engine = engine_mod.MCMEngine()
+        tools = [
+            {"name": "read_file", "description": "Read a file", "schema_size": 42}
+        ]
+        try:
+            engine.save_metadata(
+                self._build_metadata(
+                    engine_mod,
+                    "again-mcp",
+                    description="from the earlier discover",
+                    dependencies=["zod"],
+                    tools=tools,
+                    tool_count=1,
+                    complexity_score=1.0,
+                    context_cost_estimate=180,
+                    format="cli",
+                    inspected=True,
+                    inspected_at="2020-02-01T00:00:00Z",
+                )
+            )
+            engine.save_metadata(
+                self._build_metadata(
+                    engine_mod,
+                    "again-mcp",
+                    description="",
+                    dependencies=[],
+                    url="https://www.npmjs.com/package/again-mcp",
+                    source="npm",
+                    discovered_at="2021-06-01T00:00:00Z",
+                )
+            )
+        except Exception as exc:
+            self.fail("save_metadata raised %r" % (exc,))
+        saved = self._read_saved_metadata("again-mcp")
+        self.assertEqual(saved["tools"], tools)
+        self.assertEqual(saved["description"], "")
+        self.assertEqual(saved["dependencies"], [])
+        self.assertEqual(saved["tool_count"], 1)
+        self.assertEqual(saved["complexity_score"], 1.0)
+        self.assertEqual(saved["context_cost_estimate"], 180)
+        self.assertEqual(saved["format"], "cli")
+        self.assertTrue(saved["inspected"])
+        self.assertEqual(saved["inspected_at"], "2020-02-01T00:00:00Z")
+        self.assertEqual(saved["discovered_at"], "2021-06-01T00:00:00Z")
+        self.assertEqual(saved["url"], "https://www.npmjs.com/package/again-mcp")
+        self.assertEqual(saved["source"], "npm")
+
     def test_empty_description_and_null_url_keep_saved_values(self):
-        """source: an empty discover description, or an inspected url of None, replaced the saved value"""
+        """source: an empty description on a later discover replaces the saved description, and an inspected url of None keeps the saved url"""
         engine_mod = load_engine(self.mcm_home)
         engine = engine_mod.MCMEngine()
 
-        def build(name, **overrides):
-            fields = {
-                "name": name,
-                "source": "npm",
-                "url": "https://www.npmjs.com/package/" + name,
-                "description": "saved description",
-                "tools": [],
-                "tool_count": 0,
-                "complexity_score": 0.0,
-                "context_cost_estimate": 0,
-                "dependencies": ["kept"],
-                "credentials_needed": [],
-                "discovered_at": "2020-01-01T00:00:00Z",
-                "format": "direct",
-            }
-            fields.update(overrides)
-            return engine_mod.MCPMetadata(**fields)
-
         try:
-            engine.save_metadata(build("desc-mcp"))
-            engine.save_metadata(build("desc-mcp", description=""))
+            engine.save_metadata(self._build_metadata(engine_mod, "desc-mcp"))
+            engine.save_metadata(
+                self._build_metadata(engine_mod, "desc-mcp", description="")
+            )
         except Exception as exc:
             self.fail("save_metadata raised %r" % (exc,))
-        desc_path = self.mcm_home / "registry" / "desc-mcp" / "metadata.json"
-        try:
-            saved = json.loads(desc_path.read_text())
-        except Exception as exc:
-            self.fail("saved description metadata is not valid JSON: %r" % (exc,))
-        self.assertEqual(saved["description"], "saved description")
+        saved = self._read_saved_metadata("desc-mcp")
+        self.assertEqual(saved["description"], "")
 
         try:
-            engine.save_metadata(build("url-mcp", url="https://saved.example/kept"))
             engine.save_metadata(
-                build(
+                self._build_metadata(
+                    engine_mod, "url-mcp", url="https://saved.example/kept"
+                )
+            )
+            engine.save_metadata(
+                self._build_metadata(
+                    engine_mod,
                     "url-mcp",
                     url=None,
                     inspected=True,
