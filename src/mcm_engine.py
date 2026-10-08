@@ -202,11 +202,8 @@ def _merge_metadata_records(new_record: Dict, saved: Dict) -> Dict:
         ):
             if field in saved:
                 merged[field] = saved[field]
-        _preserve_saved_when_empty(merged, new_record, saved)
         return merged
-    merged = dict(new_record)
-    _preserve_saved_when_empty(merged, new_record, saved)
-    return merged
+    return dict(new_record)
 
 
 def _read_registry_index(path: Path):
@@ -702,18 +699,11 @@ _PROXY_ENV_KEYS = (
 
 
 def _proxy_value_withheld(value: str) -> bool:
-    """Return true when this proxy value must not be passed on."""
-    try:
-        parsed = urllib.parse.urlsplit(value)
-        # "user:pw@host:port" has no scheme, but urlsplit reports one.
-        # A value with no "://" is parsed as if "http://" were in front.
-        if parsed.scheme == "" or "://" not in value:
-            parsed = urllib.parse.urlsplit("http://" + value)
-        username = parsed.username
-        password = parsed.password
-    except ValueError:
-        return True
-    return username is not None or password is not None
+    """Return true when this proxy value must not be passed on.
+
+    A proxy address without credentials has no "@".
+    """
+    return "@" in value
 
 
 def _inspect_env() -> Tuple[Dict[str, str], List[str]]:
