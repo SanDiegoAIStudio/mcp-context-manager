@@ -50,7 +50,7 @@ MCM is an **inspection and organization layer**, not a runtime optimizer.
 
 ---
 
-## ✨ What MCM Actually Does
+## ✨ What MCM Does
 
 ### One-time setup
 
@@ -116,6 +116,13 @@ bash ~/.claude/scripts/mcm/main.sh discover @modelcontextprotocol/server-filesys
 
 Results land in `~/.mcm/registry/index.json`. `bash ~/.claude/scripts/mcm/main.sh status` lists them.
 
+Run `bash ~/.claude/scripts/mcm/main.sh discover` with no names in a terminal and it asks how you want to give it the list: paste it, point to a file, or scan your Claude config. The scan reads two files:
+
+- `.mcp.json` in the folder you run it from
+- `~/.claude.json`, both its own `mcpServers` and the `mcpServers` of each project listed in it
+
+It takes the package name from each server started with `npx` or `bunx`, shows you the names, and asks before it looks anything up. A server started another way is printed as skipped. When neither file names a server it can use, it prints `No MCP servers found in ./.mcp.json or ~/.claude.json` and exits with code 1.
+
 ## Inspect a server's tools
 
 - `mcm inspect <package>` starts the server with `npx -y` in a temporary folder, asks it for its tools, and stops it after 30 seconds at most.
@@ -131,6 +138,24 @@ Results land in `~/.mcm/registry/index.json`. `bash ~/.claude/scripts/mcm/main.s
 ```bash
 bash ~/.claude/scripts/mcm/main.sh inspect @modelcontextprotocol/server-filesystem -- /tmp
 ```
+
+## Uninstall
+
+`./install.sh` creates these and changes nothing else on your machine:
+
+- `~/.claude/commands/mcm.md`, the `/mcm` slash command
+- `~/.claude/scripts/mcm/`, holding `main.sh`, `discover.sh`, `status.sh`, `validate.sh` and `mcm_engine.py`
+- `~/.mcm/`, the workspace: the folders `config`, `registry`, `converted/skills`, `embeddings`, `analytics`, `cache`, `backups` and `logs`, the file `config/mcm-config.json` and the example list `cache/mcp-list-example.txt`
+
+To remove MCM:
+
+```bash
+rm ~/.claude/commands/mcm.md
+rm -r ~/.claude/scripts/mcm
+rm -r ~/.mcm
+```
+
+The last line also deletes what discover and inspect saved under `~/.mcm/registry/`; leave it out to keep that. If you installed with `MCM_HOME` set, the workspace is that folder instead of `~/.mcm`. `~/.claude/commands` and `~/.claude/scripts` are shared with other tools, so the steps above leave them in place.
 
 ---
 

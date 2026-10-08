@@ -95,6 +95,40 @@ def install_copy(home):
     return claude_scripts
 
 
+def _run_with_pty_stdin(argv, cwd, env, typed):
+    """Run argv with typed text on a pseudo-terminal as stdin."""
+    import pty
+
+    master, slave = pty.openpty()
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            argv,
+            cwd=str(cwd),
+            env=env,
+            stdin=slave,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        os.close(slave)
+        slave = -1
+        payload = typed.encode("utf-8")
+        while payload:
+            written = os.write(master, payload)
+            payload = payload[written:]
+        captured, _stderr = proc.communicate(timeout=30)
+    except Exception:
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=30)
+        raise
+    finally:
+        if slave >= 0:
+            os.close(slave)
+        os.close(master)
+    return proc.returncode, captured.decode("utf-8")
+
+
 class FakeHTTPResponse(object):
     def __init__(self, status, body):
         self._status = status
@@ -390,6 +424,202 @@ class InstallScriptTests(IsolatedHomeTest):
         self.assertIn(
             "- It passes only PATH, HOME, USER, LANG and TMPDIR from your environment, plus certificate settings (NODE_EXTRA_CA_CERTS, SSL_CERT_FILE, SSL_CERT_DIR), NO_PROXY, and proxy addresses (HTTP_PROXY, HTTPS_PROXY, ALL_PROXY) that carry no user name or password. The server can still read files under HOME, as any installed package can.",
             text,
+        )
+
+    def test_readme_uninstall_matches_what_the_installer_creates(self):
+        """source: the README named no way to remove MCM; its list must match what install.sh creates"""
+        env = isolated_env(self.home)
+        proc = subprocess.run(
+            ["bash", str(REPO_ROOT / "install.sh")],
+            cwd=str(REPO_ROOT),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(
+            proc.returncode,
+            0,
+            "install.sh failed:\n%s\n%s" % (proc.stdout, proc.stderr),
+        )
+
+        readme_lines = (REPO_ROOT / "README.md").read_text().splitlines()
+        start = None
+        for index, line in enumerate(readme_lines):
+            if line == "## Uninstall":
+                start = index
+                break
+        if start is None:
+            self.fail(
+                "README.md has no Uninstall section: no line is exactly '## Uninstall'"
+            )
+        end = len(readme_lines)
+        for index in range(start + 1, len(readme_lines)):
+            line = readme_lines[index]
+            if line.startswith("## ") or line == "---":
+                end = index
+                break
+        section = readme_lines[start:end]
+        section_text = "\n".join(section)
+
+        self.assertIn("`~/.claude/commands/mcm.md`", section_text)
+        command_path = self.home / ".claude" / "commands" / "mcm.md"
+        self.assertTrue(
+            command_path.is_file(),
+            "installer did not create %s" % command_path,
+        )
+
+        script_lines = [
+            line
+            for line in section
+            if line.startswith("- `~/.claude/scripts/mcm/`")
+        ]
+        self.assertEqual(
+            len(script_lines),
+            1,
+            "Uninstall section should have one scripts line, found %r" % (script_lines,),
+        )
+        script_names = set(
+            name
+            for name in re.findall(r"`([^`]*)`", script_lines[0])
+            if name.endswith(".sh") or name.endswith(".py")
+        )
+        scripts_dir = self.home / ".claude" / "scripts" / "mcm"
+        self.assertTrue(scripts_dir.is_dir(), "installer did not create %s" % scripts_dir)
+        present_scripts = set(
+            name
+            for name in os.listdir(str(scripts_dir))
+            if os.path.isfile(os.path.join(str(scripts_dir), name))
+        )
+        self.assertEqual(script_names, present_scripts)
+
+        workspace_lines = [
+            line for line in section if line.startswith("- `~/.mcm/`")
+        ]
+        self.assertEqual(
+            len(workspace_lines),
+            1,
+            "Uninstall section should have one workspace line, found %r"
+            % (workspace_lines,),
+        )
+        folder_names = set()
+        file_names = set()
+        mcm_root = self.home / ".mcm"
+        for name in re.findall(r"`([^`]*)`", workspace_lines[0]):
+            if name.startswith("~"):
+                continue
+            if "." in name:
+                file_names.add(name)
+                continue
+            if "/" in name:
+                folder_names.add(name.split("/", 1)[0])
+                nested = mcm_root / name
+                self.assertTrue(
+                    nested.is_dir(),
+                    "README names nested folder %s but it was not created" % name,
+                )
+            else:
+                folder_names.add(name)
+        present_folders = set(
+            name
+            for name in os.listdir(str(mcm_root))
+            if os.path.isdir(os.path.join(str(mcm_root), name))
+        )
+        self.assertEqual(folder_names, present_folders)
+        present_files = set()
+        for dirpath, _dirnames, filenames in os.walk(str(mcm_root)):
+            for name in filenames:
+                full = os.path.join(dirpath, name)
+                if os.path.islink(full) or not os.path.isfile(full):
+                    continue
+                present_files.add(
+                    os.path.relpath(full, str(mcm_root)).replace(os.sep, "/")
+                )
+        self.assertEqual(file_names, present_files)
+
+        for dirpath, _dirnames, filenames in os.walk(str(self.home)):
+            for name in filenames:
+                full = os.path.join(dirpath, name)
+                if os.path.islink(full) or not os.path.isfile(full):
+                    continue
+                rel = os.path.relpath(full, str(self.home)).replace(os.sep, "/")
+                under_command = rel == ".claude/commands/mcm.md" or rel.startswith(
+                    ".claude/commands/mcm.md/"
+                )
+                under_scripts = rel == ".claude/scripts/mcm" or rel.startswith(
+                    ".claude/scripts/mcm/"
+                )
+                under_workspace = rel == ".mcm" or rel.startswith(".mcm/")
+                self.assertTrue(
+                    under_command or under_scripts or under_workspace,
+                    "installer created %s outside the Uninstall paths" % rel,
+                )
+
+        fences = [
+            index for index, line in enumerate(section) if line.startswith("```")
+        ]
+        self.assertEqual(
+            len(fences),
+            2,
+            "Uninstall section should hold one fenced block, found %d fence lines"
+            % len(fences),
+        )
+        commands = [
+            line
+            for line in section[fences[0] + 1:fences[1]]
+            if line.strip() != ""
+        ]
+        self.assertEqual(
+            len(commands),
+            3,
+            "Uninstall fenced block should hold exactly three non-empty lines, found %r"
+            % (commands,),
+        )
+        home_real = os.path.realpath(str(self.home))
+        for line in commands:
+            matched = re.fullmatch(r"rm( -r)? (\S+)", line)
+            if matched is None:
+                self.fail(
+                    "Uninstall command must be 'rm <path>' or 'rm -r <path>', got %r"
+                    % (line,)
+                )
+            raw_path = matched.group(2)
+            self.assertTrue(
+                raw_path.startswith("~/"),
+                "uninstall path must start with '~/', got %r" % (raw_path,),
+            )
+            expanded = str(self.home) + raw_path[1:]
+            expanded_real = os.path.realpath(expanded)
+            self.assertTrue(
+                expanded_real.startswith(home_real + os.sep),
+                "refusing to remove %s (realpath %s), which is not inside %s"
+                % (expanded, expanded_real, home_real),
+            )
+            if matched.group(1) is None:
+                argv = ["rm", expanded]
+            else:
+                argv = ["rm", "-r", expanded]
+            removed = subprocess.run(argv, capture_output=True, text=True)
+            self.assertEqual(
+                removed.returncode,
+                0,
+                "uninstall command failed: %s\n%s%s"
+                % (argv, removed.stdout, removed.stderr),
+            )
+
+        left_dirs = []
+        for dirpath, _dirnames, filenames in os.walk(str(self.home)):
+            for name in filenames:
+                full = os.path.join(dirpath, name)
+                if os.path.islink(full) or not os.path.isfile(full):
+                    continue
+                self.fail("regular file left after uninstall: %s" % full)
+            rel = os.path.relpath(dirpath, str(self.home)).replace(os.sep, "/")
+            if rel != ".":
+                left_dirs.append(rel)
+        self.assertEqual(
+            set(left_dirs),
+            {".claude", ".claude/commands", ".claude/scripts"},
         )
 
 
@@ -2050,6 +2280,95 @@ class DiscoverScriptTests(IsolatedHomeTest):
         self.assertEqual(stub.returncode, 1, stub_text)
         self.assertIn("Discovery failed", stub_text)
         self.assertEqual(leftovers(), [])
+
+    def test_readme_scan_lines_match_discover(self):
+        """source: the README quotes the scan's files and its no-servers line; they must be what discover really reads and prints"""
+        try:
+            __import__("pty")
+        except ImportError:
+            self.skipTest("pty module cannot be imported")
+
+        text = (REPO_ROOT / "README.md").read_text()
+        self.assertIn("- `.mcp.json` in the folder you run it from", text)
+        self.assertIn(
+            "- `~/.claude.json`, both its own `mcpServers` and the `mcpServers` of each project listed in it",
+            text,
+        )
+        self.assertIn(
+            "it prints `No MCP servers found in ./.mcp.json or ~/.claude.json` and exits with code 1",
+            text,
+        )
+
+        scripts = install_copy(self.home)
+        discover = ["bash", str(scripts / "discover.sh")]
+
+        empty_dir = self.tmp / "scan-empty"
+        empty_dir.mkdir()
+        empty_code, empty_out = _run_with_pty_stdin(
+            discover,
+            empty_dir,
+            isolated_env(self.home),
+            "3\n",
+        )
+        self.assertEqual(empty_code, 1, empty_out)
+        self.assertIn(
+            "No MCP servers found in ./.mcp.json or ~/.claude.json",
+            empty_out,
+        )
+
+        both_dir = self.tmp / "scan-both"
+        both_dir.mkdir()
+        (both_dir / ".mcp.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "alpha": {
+                            "command": "npx",
+                            "args": ["-y", "@example/alpha-server@1.2.3"],
+                        },
+                        "local": {"command": "node", "args": ["server.js"]},
+                    }
+                }
+            )
+        )
+        (self.home / ".claude.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "beta": {"command": "bunx", "args": ["beta-server"]}
+                    },
+                    "projects": {
+                        "/somewhere": {
+                            "mcpServers": {
+                                "gamma": {
+                                    "command": "npx",
+                                    "args": ["gamma-server"],
+                                }
+                            }
+                        }
+                    },
+                }
+            )
+        )
+        both_code, both_out = _run_with_pty_stdin(
+            discover,
+            both_dir,
+            isolated_env(self.home),
+            "3\nn\n",
+        )
+        self.assertEqual(both_code, 0, both_out)
+        for piece in (
+            "These names will be looked up on npm or GitHub:",
+            "@example/alpha-server",
+            "beta-server",
+            "gamma-server",
+            "Skipped local: not started with npx or bunx",
+            "Found 3 MCPs. Proceed with discovery? (y/n)",
+            "Cancelled.",
+        ):
+            self.assertIn(piece, both_out)
+        self.assertNotIn("@1.2.3", both_out)
+        self.assertNotIn("Starting MCP discovery", both_out)
 
 
 class MainScriptTests(IsolatedHomeTest):
