@@ -29,11 +29,8 @@ if ! command -v git &> /dev/null; then
 fi
 echo "✓ Git"
 
-# Install Python dependencies
 echo ""
-echo "Installing Python dependencies..."
-python3 -m pip install --user requests >/dev/null 2>&1 || true
-echo "✓ Python packages"
+echo "✓ Python standard library only, nothing to install"
 
 # Create MCM directories
 echo ""
@@ -62,10 +59,6 @@ if [[ ! -f "$MCM_HOME/config/credentials.env" ]]; then
     cat > "$MCM_HOME/config/credentials.env" <<'EOF'
 # MCP Context Manager - Credentials
 # Fill in your API keys below
-
-# Exa.ai (for better MCP discovery)
-# Get key from: https://exa.ai
-EXA_API_KEY=
 
 # GitHub (for GitHub MCP)
 # Get from: https://github.com/settings/tokens

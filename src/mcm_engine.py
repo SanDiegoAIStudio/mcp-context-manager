@@ -7,9 +7,13 @@ Handles discovery, analysis, conversion, and management of MCPs
 import os
 import sys
 import json
+import re
 import subprocess
-import requests
+import socket
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, asdict
@@ -18,7 +22,115 @@ import hashlib
 
 # Configuration
 MCM_HOME = Path(os.getenv("MCM_HOME", Path.home() / ".mcm"))
-EXA_API_KEY = os.getenv("EXA_API_KEY", "")
+
+NPM_NAME = re.compile(
+    r"(?:@[A-Za-z0-9][A-Za-z0-9._~-]*/)?[A-Za-z0-9][A-Za-z0-9._~-]*"
+)
+GITHUB_URL = re.compile(
+    r"(?:https?://)?(?:www\.)?github\.com/([A-Za-z0-9][A-Za-z0-9-]{0,38})/([A-Za-z0-9._-]{1,100})(?:/(?:tree|blob)/\S*)?/?"
+)
+GITHUB_REPO = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}"
+)
+
+
+class SameHostRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        try:
+            old = urllib.parse.urlsplit(req.full_url)
+            new = urllib.parse.urlsplit(newurl)
+            old_port = old.port
+            if old_port is None:
+                old_port = 443 if old.scheme == "https" else 80
+            new_port = new.port
+            if new_port is None:
+                new_port = 443 if new.scheme == "https" else 80
+        except ValueError:
+            return None
+        old_host = old.hostname
+        new_host = new.hostname
+        if old_host is None or new_host is None:
+            return None
+        if (
+            old.scheme != new.scheme
+            or old_host.lower() != new_host.lower()
+            or old_port != new_port
+        ):
+            return None
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_OPENER = urllib.request.build_opener(SameHostRedirectHandler)
+
+
+def open_url(request, timeout):
+    return _OPENER.open(request, timeout=timeout)
+
+
+def http_request(
+    method: str,
+    url: str,
+    headers: Optional[Dict[str, str]] = None,
+    json_body: Optional[Dict] = None,
+    timeout: float = 30,
+) -> Tuple[int, str]:
+    """Send an HTTP request and return (status_code, response_text)."""
+    req_headers = dict(headers) if headers else {}
+    if "User-Agent" not in req_headers:
+        req_headers["User-Agent"] = "mcp-context-manager"
+
+    data = None
+    if json_body is not None:
+        req_headers["Content-Type"] = "application/json"
+        data = json.dumps(json_body).encode("utf-8")
+
+    request = urllib.request.Request(
+        url, data=data, headers=req_headers, method=method
+    )
+
+    try:
+        with open_url(request, timeout=timeout) as response:
+            status = response.getcode()
+            raw = response.read()
+            if isinstance(raw, bytes):
+                text = raw.decode("utf-8", errors="replace")
+            else:
+                text = raw or ""
+            return (status, text)
+    except urllib.error.HTTPError as exc:
+        try:
+            raw = exc.read()
+        except Exception:
+            raw = b""
+        if isinstance(raw, bytes):
+            body = raw.decode("utf-8", errors="replace")
+        else:
+            body = raw or ""
+        return (exc.code, body)
+    except urllib.error.URLError as exc:
+        reason = getattr(exc, "reason", None)
+        return (0, str(reason) if reason is not None else str(exc))
+    except (TimeoutError, socket.timeout) as exc:
+        return (0, str(exc))
+
+
+def http_error(label: str, status: int, text: str) -> Exception:
+    if status == 0:
+        return Exception(f"{label}: could not connect ({text})")
+    if 300 <= status <= 399:
+        return Exception(f"{label}: {status} (a redirect to another host was refused)")
+    return Exception(f"{label}: {status}")
+
+
+def safe_child(root: Path, name: str) -> Path:
+    if Path(name).is_absolute():
+        raise ValueError(f"refusing to write outside {root}: {name!r}")
+    root_resolved = root.resolve()
+    resolved = (root / name).resolve()
+    if resolved == root_resolved or not resolved.is_relative_to(root_resolved):
+        raise ValueError(f"refusing to write outside {root}: {name!r}")
+    return resolved
+
 
 @dataclass
 class MCPMetadata:
@@ -98,30 +210,55 @@ class MCMEngine:
     def parse_mcp_input(self, input_text: str) -> List[Dict[str, str]]:
         """Parse user input and extract MCP identifiers"""
         mcps = []
-        lines = [line.strip() for line in input_text.strip().split("\n") if line.strip()]
 
-        for line in lines:
+        for raw in input_text.split("\n"):
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+
             mcp = {"original": line, "type": "unknown", "identifier": line}
 
-            # GitHub URL
             if "github.com" in line:
-                mcp["type"] = "github_url"
-                mcp["identifier"] = line.split("github.com/")[-1].rstrip("/")
-            # NPM package
-            elif line.startswith("@") or "/" not in line:
-                if line.startswith("@modelcontextprotocol/"):
-                    mcp["type"] = "npm_official"
-                    mcp["identifier"] = line
-                    mcp["name"] = line.replace("@modelcontextprotocol/server-", "")
+                match = GITHUB_URL.fullmatch(line)
+                if match:
+                    owner = match.group(1)
+                    repo = match.group(2)
+                    if repo.endswith(".git"):
+                        repo = repo[:-4]
+                    if (not repo) or repo in (".", ".."):
+                        mcp["type"] = "invalid"
+                        mcp["reason"] = (
+                            "not a GitHub repository URL (https://github.com/owner/repo)"
+                        )
+                    else:
+                        mcp["type"] = "github_url"
+                        mcp["identifier"] = owner + "/" + repo
                 else:
-                    mcp["type"] = "npm_package"
-                    mcp["identifier"] = line
-                    mcp["name"] = line.split("/")[-1]
-            # Simple name
-            else:
-                mcp["type"] = "name"
+                    mcp["type"] = "invalid"
+                    mcp["reason"] = (
+                        "not a GitHub repository URL (https://github.com/owner/repo)"
+                    )
+            elif (
+                line.startswith("@modelcontextprotocol/")
+                and NPM_NAME.fullmatch(line)
+                and len(line) <= 214
+            ):
+                mcp["type"] = "npm_official"
                 mcp["identifier"] = line
-                mcp["name"] = line
+                mcp["name"] = line.replace("@modelcontextprotocol/server-", "")
+            elif (
+                NPM_NAME.fullmatch(line)
+                and len(line) <= 214
+                and (line.startswith("@") or "/" not in line)
+            ):
+                mcp["type"] = "npm_package"
+                mcp["identifier"] = line
+                mcp["name"] = line.split("/")[-1]
+            else:
+                mcp["type"] = "invalid"
+                mcp["reason"] = (
+                    "not an npm package name, a GitHub repository URL or a plain name"
+                )
 
             mcps.append(mcp)
 
@@ -129,6 +266,14 @@ class MCMEngine:
 
     def discover_mcp(self, mcp_info: Dict) -> Optional[MCPMetadata]:
         """Discover and analyze a single MCP"""
+        if mcp_info["type"] == "invalid":
+            original = mcp_info.get("original", mcp_info.get("identifier", ""))
+            self.log(
+                f"Skipped {original!r}: {mcp_info['reason']}",
+                "warning",
+            )
+            return None
+
         self.log(f"Discovering: {mcp_info['identifier']}", "info")
 
         try:
@@ -138,8 +283,12 @@ class MCMEngine:
             elif mcp_info["type"] in ["npm_official", "npm_package"]:
                 return self.discover_from_npm(mcp_info)
             else:
-                # Try Exa.ai search
-                return self.discover_via_search(mcp_info)
+                original = mcp_info.get("original", mcp_info.get("identifier", ""))
+                self.log(
+                    f"Skipped {original!r}: not an npm package name or a GitHub repository URL",
+                    "warning",
+                )
+                return None
 
         except Exception as e:
             self.log(f"Discovery failed for {mcp_info['identifier']}: {str(e)}", "error")
@@ -148,6 +297,13 @@ class MCMEngine:
     def discover_from_github(self, mcp_info: Dict) -> Optional[MCPMetadata]:
         """Discover MCP from GitHub repository"""
         repo_path = mcp_info["identifier"]
+        if (
+            GITHUB_REPO.fullmatch(repo_path) is None
+            or repo_path.endswith("/.")
+            or repo_path.endswith("/..")
+        ):
+            raise Exception(f"not a GitHub repository: {repo_path!r}")
+
         api_url = f"https://api.github.com/repos/{repo_path}"
 
         # Get repo info
@@ -155,42 +311,43 @@ class MCMEngine:
         if github_token := os.getenv("GITHUB_TOKEN"):
             headers["Authorization"] = f"token {github_token}"
 
-        response = requests.get(api_url, headers=headers)
-        if response.status_code != 200:
-            raise Exception(f"GitHub API error: {response.status_code}")
+        token_note = " (with your GITHUB_TOKEN)" if github_token else ""
+        print(f"  → api.github.com: {repo_path}{token_note}")
 
-        repo_data = response.json()
+        status, text = http_request("GET", api_url, headers=headers)
+        if status != 200:
+            raise http_error("GitHub API error", status, text)
+
+        repo_data = json.loads(text)
 
         # Extract package.json if exists
+        print(f"  → raw.githubusercontent.com: {repo_path} package.json")
         package_url = f"https://raw.githubusercontent.com/{repo_path}/main/package.json"
         try:
-            pkg_response = requests.get(package_url)
-            if pkg_response.status_code == 200:
-                package_json = pkg_response.json()
+            pkg_status, pkg_text = http_request("GET", package_url)
+            if pkg_status == 200:
+                package_json = json.loads(pkg_text)
             else:
                 # Try master branch
                 package_url = f"https://raw.githubusercontent.com/{repo_path}/master/package.json"
-                pkg_response = requests.get(package_url)
-                package_json = pkg_response.json() if pkg_response.status_code == 200 else {}
+                pkg_status, pkg_text = http_request("GET", package_url)
+                package_json = json.loads(pkg_text) if pkg_status == 200 else {}
         except:
             package_json = {}
-
-        # Analyze repository structure
-        tools = self.analyze_mcp_tools(repo_path, headers)
 
         metadata = MCPMetadata(
             name=repo_data["name"],
             source="github",
             url=repo_data["html_url"],
             description=repo_data.get("description", ""),
-            tools=tools,
-            tool_count=len(tools),
-            complexity_score=self.calculate_complexity(tools),
-            context_cost_estimate=self.estimate_context_cost(tools),
+            tools=[],
+            tool_count=0,
+            complexity_score=0.0,
+            context_cost_estimate=0,
             dependencies=list(package_json.get("dependencies", {}).keys()) if package_json else [],
-            credentials_needed=self.detect_credentials(tools),
+            credentials_needed=self.detect_credentials([]),
             discovered_at=datetime.utcnow().isoformat() + "Z",
-            format=self.determine_optimal_format(tools)
+            format="direct"
         )
 
         return metadata
@@ -200,11 +357,12 @@ class MCMEngine:
         package_name = mcp_info["identifier"]
         npm_url = f"https://registry.npmjs.org/{package_name}"
 
-        response = requests.get(npm_url)
-        if response.status_code != 200:
-            raise Exception(f"NPM registry error: {response.status_code}")
+        print(f"  → registry.npmjs.org: {package_name}")
+        status, text = http_request("GET", npm_url)
+        if status != 200:
+            raise http_error("NPM registry error", status, text)
 
-        npm_data = response.json()
+        npm_data = json.loads(text)
         latest_version = npm_data["dist-tags"]["latest"]
         latest_data = npm_data["versions"][latest_version]
 
@@ -237,81 +395,6 @@ class MCMEngine:
         )
 
         return metadata
-
-    def discover_via_search(self, mcp_info: Dict) -> Optional[MCPMetadata]:
-        """Discover MCP using Exa.ai search"""
-        query = f"model context protocol MCP {mcp_info['identifier']} server"
-
-        if not EXA_API_KEY:
-            self.log("EXA_API_KEY not set, falling back to basic search", "warning")
-            return None
-
-        headers = {
-            "Content-Type": "application/json",
-            "x-api-key": EXA_API_KEY
-        }
-
-        data = {
-            "query": query,
-            "numResults": 3,
-            "useAutoprompt": True,
-            "type": "neural"
-        }
-
-        response = requests.post("https://api.exa.ai/search", headers=headers, json=data)
-        if response.status_code != 200:
-            raise Exception(f"Exa.ai API error: {response.status_code}")
-
-        results = response.json().get("results", [])
-
-        # Try to find GitHub repo in results
-        for result in results:
-            url = result.get("url", "")
-            if "github.com" in url:
-                github_path = url.split("github.com/")[-1].split("/")[0:2]
-                github_path = "/".join(github_path)
-                return self.discover_from_github({"identifier": github_path, "type": "github_url"})
-
-        return None
-
-    def analyze_mcp_tools(self, repo_path: str, headers: Dict) -> List[Dict]:
-        """Analyze MCP repository to extract tool definitions"""
-        # This is a simplified version - would need more sophisticated analysis
-        tools = []
-
-        # Try to fetch common MCP server files
-        possible_files = [
-            "src/index.ts",
-            "src/index.js",
-            "index.ts",
-            "index.js",
-            "server.ts",
-            "server.js"
-        ]
-
-        for file_path in possible_files:
-            url = f"https://raw.githubusercontent.com/{repo_path}/main/{file_path}"
-            try:
-                response = requests.get(url)
-                if response.status_code == 200:
-                    content = response.text
-                    # Simple pattern matching for tools
-                    # Real implementation would parse AST
-                    if "addTool" in content or "server.tool" in content:
-                        # Extract tool names (simplified)
-                        import re
-                        tool_patterns = re.findall(r'name:\s*["\']([^"\']+)["\']', content)
-                        for tool_name in tool_patterns:
-                            tools.append({
-                                "name": tool_name,
-                                "description": "",
-                                "parameters": []
-                            })
-                    break
-            except:
-                continue
-
-        return tools if tools else [{"name": "unknown", "description": "", "parameters": []}]
 
     def calculate_complexity(self, tools: List[Dict]) -> float:
         """Calculate complexity score for tools"""
@@ -368,7 +451,7 @@ class MCMEngine:
 
     def save_metadata(self, metadata: MCPMetadata):
         """Save MCP metadata to registry"""
-        registry_dir = self.mcm_home / "registry" / metadata.name
+        registry_dir = safe_child(self.mcm_home / "registry", metadata.name)
         registry_dir.mkdir(parents=True, exist_ok=True)
 
         metadata_file = registry_dir / "metadata.json"
@@ -399,6 +482,80 @@ class MCMEngine:
         with open(index_file, "w") as f:
             json.dump(index, f, indent=2)
 
+
+def scan_claude_config(project_dir: Path, home: Path) -> Tuple[List[str], List[str]]:
+    packages = []  # type: List[str]
+    skipped = []  # type: List[str]
+
+    def strip_version(package):
+        if package.startswith("@"):
+            idx = package.find("@", 1)
+            if idx != -1:
+                return package[:idx]
+            return package
+        idx = package.find("@")
+        if idx != -1:
+            return package[:idx]
+        return package
+
+    def npx_package(entry):
+        if not isinstance(entry, dict):
+            return None
+        command = entry.get("command")
+        if not isinstance(command, str):
+            return None
+        base = os.path.basename(command)
+        if base not in ("npx", "bunx"):
+            return None
+        args = entry.get("args")
+        if not isinstance(args, list):
+            return None
+        for arg in args:
+            if isinstance(arg, str) and not arg.startswith("-"):
+                return strip_version(arg)
+        return None
+
+    def ingest(obj):
+        if not isinstance(obj, dict):
+            return
+        servers = obj.get("mcpServers")
+        if not isinstance(servers, dict):
+            return
+        for name, entry in servers.items():
+            package = npx_package(entry)
+            if package is not None:
+                if package not in packages:
+                    packages.append(package)
+            else:
+                skip_entry = f"{name}: not started with npx or bunx"
+                if skip_entry not in skipped:
+                    skipped.append(skip_entry)
+
+    def load_object(path):
+        try:
+            with open(path) as handle:
+                data = json.load(handle)
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            return None
+        if isinstance(data, dict):
+            return data
+        return None
+
+    project_cfg = load_object(project_dir / ".mcp.json")
+    if project_cfg is not None:
+        ingest(project_cfg)
+
+    home_cfg = load_object(home / ".claude.json")
+    if home_cfg is not None:
+        ingest(home_cfg)
+        projects = home_cfg.get("projects")
+        if isinstance(projects, dict):
+            for value in projects.values():
+                ingest(value)
+
+    return (packages, skipped)
+
+
 def main():
     """Main entry point"""
     engine = MCMEngine()
@@ -421,17 +578,34 @@ def main():
         mcps = engine.parse_mcp_input(mcp_text)
         print(f"Found {len(mcps)} MCPs to discover\n")
 
+        ok = 0
         for i, mcp_info in enumerate(mcps, 1):
             print(f"[{i}/{len(mcps)}] Discovering {mcp_info['identifier']}...")
             metadata = engine.discover_mcp(mcp_info)
 
             if metadata:
-                engine.save_metadata(metadata)
-                print(f"  ✓ {metadata.name}: {metadata.tool_count} tools, format: {metadata.format}")
+                try:
+                    engine.save_metadata(metadata)
+                except (ValueError, OSError) as exc:
+                    print(f"  ✗ {metadata.name}: not saved ({exc})")
+                else:
+                    print(f"  ✓ {metadata.name}: saved")
+                    ok += 1
             else:
                 print(f"  ✗ Failed to discover")
 
             time.sleep(1)  # Rate limiting
+
+        print(f"Discovered {ok} of {len(mcps)}")
+        if len(mcps) > 0 and ok == 0:
+            sys.exit(1)
+
+    elif command == "scan-config":
+        packages, skipped = scan_claude_config(Path.cwd(), Path.home())
+        for package in packages:
+            print(package)
+        for entry in skipped:
+            print(f"Skipped {entry}", file=sys.stderr)
 
     elif command == "list":
         index_file = engine.mcm_home / "registry" / "index.json"
