@@ -121,7 +121,7 @@ Results land in `~/.mcm/registry/index.json`. `bash ~/.claude/scripts/mcm/main.s
 - `mcm inspect <package>` starts the server with `npx -y` in a temporary folder, asks it for its tools, and stops it after 30 seconds at most.
 - The stop reaches the server and the processes it started, unless one of them starts its own session; such a process can keep running after inspect returns.
 - It prints "This runs <package>'s own code on your machine, the same as installing it." and asks before starting, unless you pass --yes.
-- It passes only PATH, HOME, USER, LANG and TMPDIR from your environment, plus proxy and certificate settings when they are set (HTTP_PROXY, HTTPS_PROXY, NO_PROXY, ALL_PROXY, NODE_EXTRA_CA_CERTS, SSL_CERT_FILE, SSL_CERT_DIR).
+- It passes only PATH, HOME, USER, LANG and TMPDIR from your environment, plus certificate settings (NODE_EXTRA_CA_CERTS, SSL_CERT_FILE, SSL_CERT_DIR), NO_PROXY, and proxy addresses (HTTP_PROXY, HTTPS_PROXY, ALL_PROXY) that carry no user name or password. The server can still read files under HOME, as any installed package can.
 - It saves tool names, descriptions cut to 200 characters and schema sizes.
 - Status and validate show real counts only for inspected servers and "not inspected" for the rest.
 - The token figure is the tool definitions' characters divided by 4.

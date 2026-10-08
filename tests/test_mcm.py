@@ -380,7 +380,15 @@ class InstallScriptTests(IsolatedHomeTest):
         self.assertNotIn("python-3.10+", text)
         self.assertNotIn("Python 3.10+", text)
         self.assertIn(
-            "It passes only PATH, HOME, USER, LANG and TMPDIR from your environment, plus proxy and certificate settings when they are set (HTTP_PROXY, HTTPS_PROXY, NO_PROXY, ALL_PROXY, NODE_EXTRA_CA_CERTS, SSL_CERT_FILE, SSL_CERT_DIR).",
+            "It passes only PATH, HOME, USER, LANG and TMPDIR from your environment, plus certificate settings (NODE_EXTRA_CA_CERTS, SSL_CERT_FILE, SSL_CERT_DIR), NO_PROXY, and proxy addresses (HTTP_PROXY, HTTPS_PROXY, ALL_PROXY) that carry no user name or password. The server can still read files under HOME, as any installed package can.",
+            text,
+        )
+
+    def test_readme_inspect_bullet_skips_proxy_credentials(self):
+        """source: the README said inspect passes every proxy setting that is set"""
+        text = (REPO_ROOT / "README.md").read_text()
+        self.assertIn(
+            "- It passes only PATH, HOME, USER, LANG and TMPDIR from your environment, plus certificate settings (NODE_EXTRA_CA_CERTS, SSL_CERT_FILE, SSL_CERT_DIR), NO_PROXY, and proxy addresses (HTTP_PROXY, HTTPS_PROXY, ALL_PROXY) that carry no user name or password. The server can still read files under HOME, as any installed package can.",
             text,
         )
 
@@ -985,6 +993,27 @@ class NpmDiscoverTests(IsolatedHomeTest):
                     )
             self.assertEqual(type(ctx.exception), Exception)
             self.assertEqual(str(ctx.exception), expected)
+
+    def test_discover_from_npm_latest_list_has_no_latest_version(self):
+        """source: a dist-tags latest that was a list raised TypeError instead of reporting no latest version"""
+        engine_mod = load_engine(self.mcm_home)
+        engine = engine_mod.MCMEngine()
+        npm_doc = {
+            "name": "demo-mcp",
+            "dist-tags": {"latest": ["1.0.0"]},
+            "versions": {"1.0.0": {"description": "present"}},
+        }
+
+        def fake_http(method, url, headers=None, json_body=None, timeout=30):
+            return (200, json.dumps(npm_doc))
+
+        with patch.object(engine_mod, "http_request", side_effect=fake_http):
+            with self.assertRaises(Exception) as ctx:
+                engine.discover_from_npm(
+                    {"identifier": "demo-mcp", "type": "npm_package"}
+                )
+        self.assertEqual(type(ctx.exception), Exception)
+        self.assertIn("has no latest version", str(ctx.exception))
 
     def test_discover_then_inspect_keeps_description_and_tools(self):
         """source: inspect saved an empty description and empty dependencies, wiping what discover had saved"""
@@ -2834,6 +2863,121 @@ class InspectTests(IsolatedHomeTest):
         self.assertIn("NODE_EXTRA_CA_CERTS", seen)
         self.assertNotIn("SECRET_TOKEN", seen)
 
+    def test_inspect_withholds_proxy_userinfo(self):
+        """source: a proxy address with a user name or password was passed to the untrusted server"""
+        engine_mod = load_engine(self.mcm_home)
+        note = (
+            "a proxy setting that holds a user name or password was not passed to the server"
+        )
+        keys = (
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        )
+        saved = {}
+        for key in keys:
+            saved[key] = os.environ.get(key)
+
+        def restore():
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+        def clear_proxies():
+            for key in keys:
+                os.environ.pop(key, None)
+
+        def run_env():
+            report = self.tmp / "env-report.json"
+            if report.exists():
+                report.unlink()
+            notes = []
+            try:
+                engine_mod.inspect_command(
+                    [sys.executable, FAKE, "env", str(report)],
+                    timeout=10,
+                    notes=notes,
+                )
+            except Exception as exc:
+                self.fail("env mode inspect raised: %s" % exc)
+            try:
+                info = json.loads(report.read_text())
+            except Exception as exc:
+                self.fail("env report is not valid JSON: %r" % (exc,))
+            return info, notes
+
+        try:
+            clear_proxies()
+            user = "user"
+            password = "pass"
+            host = "proxy.example.test:8080"
+            os.environ["HTTPS_PROXY"] = "http://%s:%s@%s" % (user, password, host)
+            try:
+                env, withheld = engine_mod._inspect_env()
+            except Exception as exc:
+                self.fail("_inspect_env raised %r" % (exc,))
+            self.assertNotIn("HTTPS_PROXY", env)
+            self.assertIn("HTTPS_PROXY", withheld)
+            info, notes = run_env()
+            self.assertNotIn("HTTPS_PROXY", info["keys"])
+            self.assertIn(note, notes)
+
+            clear_proxies()
+            os.environ["HTTPS_PROXY"] = "http://proxy.example.test:8080"
+            try:
+                env, withheld = engine_mod._inspect_env()
+            except Exception as exc:
+                self.fail("_inspect_env raised %r" % (exc,))
+            self.assertEqual(env.get("HTTPS_PROXY"), "http://proxy.example.test:8080")
+            self.assertNotIn("HTTPS_PROXY", withheld)
+            info, notes = run_env()
+            self.assertIn("HTTPS_PROXY", info["keys"])
+            self.assertNotIn(note, notes)
+
+            clear_proxies()
+            os.environ["http_proxy"] = "user:pw@proxy.example.test:8080"
+            try:
+                env, withheld = engine_mod._inspect_env()
+            except Exception as exc:
+                self.fail("_inspect_env raised %r" % (exc,))
+            self.assertNotIn("http_proxy", env)
+            self.assertIn("http_proxy", withheld)
+            info, notes = run_env()
+            self.assertNotIn("http_proxy", info["keys"])
+            self.assertIn(note, notes)
+        finally:
+            restore()
+
+    def test_inspect_cli_prints_withheld_proxy_note(self):
+        """source: mcm inspect did not say when a proxy setting with a user name or password was withheld"""
+        saved = os.environ.get("HTTPS_PROXY")
+        user = "user"
+        password = "pw"
+        os.environ["HTTPS_PROXY"] = "http://%s:%s@proxy.example.test:8080" % (
+            user,
+            password,
+        )
+        try:
+            proc, _record = self._run_inspect(
+                ["inspect", "fake-pkg", "--yes", "--", "ok"]
+            )
+        finally:
+            if saved is None:
+                os.environ.pop("HTTPS_PROXY", None)
+            else:
+                os.environ["HTTPS_PROXY"] = saved
+        combined = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 0, combined)
+        self.assertIn(
+            "Note: a proxy setting that holds a user name or password was not passed to the server",
+            proc.stdout,
+        )
+
     def test_inspect_timeout_says_to_run_again(self):
         """source: a timeout during the first download gave no hint to run it again"""
         engine_mod = load_engine(self.mcm_home)
@@ -2974,7 +3118,7 @@ class InspectTests(IsolatedHomeTest):
         self.assertIsNone(escaped, "raised %r" % (escaped,))
         self.assertEqual(code, 1)
         combined = out.getvalue() + err.getvalue()
-        self.assertIn("Error: could not start npx (boom)", combined)
+        self.assertIn("Error: inspect could not run (boom)", combined)
         self.assertNotIn("Traceback", combined)
 
         out = io.StringIO()
@@ -2999,6 +3143,53 @@ class InspectTests(IsolatedHomeTest):
         self.assertEqual(code, 1)
         combined = out.getvalue() + err.getvalue()
         self.assertIn("Not started.", combined)
+        self.assertNotIn("Traceback", combined)
+
+    def test_inspect_oserror_says_could_not_run(self):
+        """source: an OSError outside the exchange was reported as could not start npx"""
+        engine_mod = load_engine(self.mcm_home)
+        engine = engine_mod.MCMEngine()
+        saved_proxy = os.environ.get("HTTPS_PROXY")
+        user = "user"
+        password = "pw"
+        os.environ["HTTPS_PROXY"] = "http://%s:%s@proxy.example.test:8080" % (
+            user,
+            password,
+        )
+        out = io.StringIO()
+        err = io.StringIO()
+        escaped = None
+        code = None
+        try:
+            with patch.object(
+                engine_mod.sys,
+                "argv",
+                ["mcm_engine.py", "inspect", "demo-pkg", "--yes"],
+            ), patch.object(
+                engine_mod.shutil, "which", return_value="/usr/bin/npx"
+            ), patch.object(
+                engine_mod.subprocess, "Popen", side_effect=OSError("boom")
+            ), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                try:
+                    engine_mod._cmd_inspect(engine)
+                except SystemExit as exc:
+                    code = exc.code
+                except Exception as exc:
+                    escaped = exc
+        finally:
+            if saved_proxy is None:
+                os.environ.pop("HTTPS_PROXY", None)
+            else:
+                os.environ["HTTPS_PROXY"] = saved_proxy
+        self.assertIsNone(escaped, "raised %r" % (escaped,))
+        self.assertEqual(code, 1)
+        combined = out.getvalue() + err.getvalue()
+        self.assertIn("Error: inspect could not run (", combined)
+        note = (
+            "Note: a proxy setting that holds a user name or password was not passed to the server"
+        )
+        self.assertIn(note, combined)
+        self.assertLess(combined.find(note), combined.find("Error: inspect could not run ("))
         self.assertNotIn("Traceback", combined)
 
 
@@ -3029,7 +3220,8 @@ class RegistryIndexTests(IsolatedHomeTest):
             engine.save_metadata(self._metadata(engine_mod))
         self.assertEqual(
             str(ctx.exception),
-            "the registry index is not valid JSON: %s" % index_path,
+            "The registry index is not valid JSON: %s. Move it aside and run discover again."
+            % index_path,
         )
 
         env = isolated_env(self.home)
@@ -3168,7 +3360,7 @@ class RegistryIndexTests(IsolatedHomeTest):
         env = isolated_env(self.home)
         engine = str(SRC_DIR / "mcm_engine.py")
         expected = (
-            "The registry index is not valid JSON: %s. Move it aside and run discover again."
+            "The registry index is not in the expected shape: %s. Move it aside and run discover again."
             % index_path
         )
 
@@ -3244,6 +3436,212 @@ class RegistryIndexTests(IsolatedHomeTest):
         self.assertIn("inspected, 0 tools", validate_text)
         self.assertNotIn("Traceback", validate_text)
         self.assertNotIn("None", validate_text)
+
+    def test_index_utf8_and_list_use_different_sentences(self):
+        """source: an index that was not UTF-8, or a JSON list, traced back or shared one sentence"""
+        registry = self.mcm_home / "registry"
+        registry.mkdir(parents=True)
+        index_path = registry / "index.json"
+        env = isolated_env(self.home)
+        engine = str(SRC_DIR / "mcm_engine.py")
+        json_sentence = (
+            "The registry index is not valid JSON: %s. Move it aside and run discover again."
+            % index_path
+        )
+        shape_sentence = (
+            "The registry index is not in the expected shape: %s. Move it aside and run discover again."
+            % index_path
+        )
+
+        def run_list():
+            return subprocess.run(
+                [sys.executable, engine, "list"],
+                cwd=str(self.tmp),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+
+        def run_script(name):
+            return subprocess.run(
+                ["bash", str(SRC_DIR / "commands" / name)],
+                cwd=str(self.tmp),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+
+        index_path.write_bytes(b"\xff\xfe{")
+        proc = run_list()
+        combined = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 1, combined)
+        self.assertIn(json_sentence, combined)
+        self.assertNotIn("expected shape", combined)
+        self.assertNotIn("Traceback", combined)
+        for script in ("status.sh", "validate.sh"):
+            proc = run_script(script)
+            combined = proc.stdout + proc.stderr
+            self.assertEqual(proc.returncode, 1, combined)
+            self.assertIn(json_sentence, combined)
+            self.assertNotIn("expected shape", combined)
+            self.assertNotIn("Traceback", combined)
+
+        index_path.write_text("[]")
+        proc = run_list()
+        combined = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 1, combined)
+        self.assertIn(shape_sentence, combined)
+        self.assertNotIn("not valid JSON", combined)
+        self.assertNotIn("Traceback", combined)
+        for script in ("status.sh", "validate.sh"):
+            proc = run_script(script)
+            combined = proc.stdout + proc.stderr
+            self.assertEqual(proc.returncode, 1, combined)
+            self.assertIn(shape_sentence, combined)
+            self.assertNotIn("not valid JSON", combined)
+            self.assertNotIn("Traceback", combined)
+
+    def test_non_finite_and_bool_counts_are_zero(self):
+        """source: a tool_count of NaN or true was shown as nan or 1 by list and status"""
+        registry = self.mcm_home / "registry"
+        registry.mkdir(parents=True)
+        index_path = registry / "index.json"
+        index_path.write_text(
+            "{"
+            '"mcps": ['
+            '{"name": "qty-float", "inspected": true, "tool_count": NaN, '
+            '"context_tokens": NaN, "format": "cli"},'
+            '{"name": "qty-flag", "inspected": true, "tool_count": true, '
+            '"context_tokens": true, "format": "cli"}'
+            "]"
+            "}"
+        )
+        env = isolated_env(self.home)
+        listed = subprocess.run(
+            [sys.executable, str(SRC_DIR / "mcm_engine.py"), "list"],
+            cwd=str(self.tmp),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        listed_text = listed.stdout + listed.stderr
+        self.assertEqual(listed.returncode, 0, listed_text)
+        self.assertNotIn("Traceback", listed_text)
+        for name in ("qty-float", "qty-flag"):
+            matches = [line for line in listed.stdout.splitlines() if name in line]
+            self.assertEqual(len(matches), 1, listed_text)
+            self.assertIn("0 tools", matches[0])
+            self.assertNotIn("nan", matches[0].lower())
+            self.assertNotIn("1 tools", matches[0])
+        status = subprocess.run(
+            ["bash", str(SRC_DIR / "commands" / "status.sh")],
+            cwd=str(self.tmp),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        status_text = status.stdout + status.stderr
+        self.assertEqual(status.returncode, 0, status_text)
+        self.assertNotIn("Traceback", status_text)
+        for name in ("qty-float", "qty-flag"):
+            matches = [line for line in status.stdout.splitlines() if name in line]
+            self.assertEqual(len(matches), 1, status_text)
+            self.assertIn("0 tools", matches[0])
+            self.assertIn("~0 tokens", matches[0])
+            self.assertNotIn("nan", matches[0].lower())
+            self.assertNotIn("1 tools", matches[0])
+
+    def test_empty_description_and_null_url_keep_saved_values(self):
+        """source: an empty discover description, or an inspected url of None, replaced the saved value"""
+        engine_mod = load_engine(self.mcm_home)
+        engine = engine_mod.MCMEngine()
+
+        def build(name, **overrides):
+            fields = {
+                "name": name,
+                "source": "npm",
+                "url": "https://www.npmjs.com/package/" + name,
+                "description": "saved description",
+                "tools": [],
+                "tool_count": 0,
+                "complexity_score": 0.0,
+                "context_cost_estimate": 0,
+                "dependencies": ["kept"],
+                "credentials_needed": [],
+                "discovered_at": "2020-01-01T00:00:00Z",
+                "format": "direct",
+            }
+            fields.update(overrides)
+            return engine_mod.MCPMetadata(**fields)
+
+        try:
+            engine.save_metadata(build("desc-mcp"))
+            engine.save_metadata(build("desc-mcp", description=""))
+        except Exception as exc:
+            self.fail("save_metadata raised %r" % (exc,))
+        desc_path = self.mcm_home / "registry" / "desc-mcp" / "metadata.json"
+        try:
+            saved = json.loads(desc_path.read_text())
+        except Exception as exc:
+            self.fail("saved description metadata is not valid JSON: %r" % (exc,))
+        self.assertEqual(saved["description"], "saved description")
+
+        try:
+            engine.save_metadata(build("url-mcp", url="https://saved.example/kept"))
+            engine.save_metadata(
+                build(
+                    "url-mcp",
+                    url=None,
+                    inspected=True,
+                    inspected_at="2020-02-01T00:00:00Z",
+                    tools=[{"name": "a", "description": "", "schema_size": 1}],
+                    tool_count=1,
+                    format="cli",
+                )
+            )
+        except Exception as exc:
+            self.fail("save_metadata raised %r" % (exc,))
+        url_path = self.mcm_home / "registry" / "url-mcp" / "metadata.json"
+        try:
+            saved_url = json.loads(url_path.read_text())
+        except Exception as exc:
+            self.fail("saved url metadata is not valid JSON: %r" % (exc,))
+        self.assertEqual(saved_url["url"], "https://saved.example/kept")
+
+    def test_save_metadata_reports_unreadable_and_wrong_shaped_index(self):
+        """source: save_metadata rewrote an index that was not UTF-8 or not an object"""
+        engine_mod = load_engine(self.mcm_home)
+        engine = engine_mod.MCMEngine()
+        index_path = self.mcm_home / "registry" / "index.json"
+        index_path.parent.mkdir(parents=True, exist_ok=True)
+        index_path.write_bytes(b"\xff\xfe")
+        with self.assertRaises(ValueError) as ctx:
+            engine.save_metadata(self._metadata(engine_mod))
+        self.assertEqual(
+            str(ctx.exception),
+            "The registry index is not valid JSON: %s. Move it aside and run discover again."
+            % index_path,
+        )
+        index_path.write_text("[]")
+        with self.assertRaises(ValueError) as ctx:
+            engine.save_metadata(self._metadata(engine_mod))
+        self.assertEqual(
+            str(ctx.exception),
+            "The registry index is not in the expected shape: %s. Move it aside and run discover again."
+            % index_path,
+        )
+        index_path.write_text('{"mcps": {"name": "x"}}')
+        with self.assertRaises(ValueError) as ctx:
+            engine.save_metadata(self._metadata(engine_mod))
+        self.assertEqual(
+            str(ctx.exception),
+            "The registry index is not in the expected shape: %s. Move it aside and run discover again."
+            % index_path,
+        )
 
 
 if __name__ == "__main__":

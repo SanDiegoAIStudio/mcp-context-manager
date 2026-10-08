@@ -7,6 +7,7 @@ Handles discovery, analysis, conversion, and management of MCPs
 import os
 import sys
 import json
+import math
 import re
 import queue
 import shutil
@@ -150,7 +151,20 @@ def _write_json_atomic(path: Path, payload) -> None:
 
 
 def _metadata_value_empty(value) -> bool:
-    return value == "" or value == []
+    return value is None or value == "" or value == []
+
+
+def _preserve_saved_when_empty(merged: Dict, new_record: Dict, saved: Dict) -> None:
+    """Keep saved text fields when the new record leaves them empty."""
+    for field in (
+        "description",
+        "dependencies",
+        "credentials_needed",
+        "url",
+        "source",
+    ):
+        if _metadata_value_empty(new_record.get(field)) and field in saved:
+            merged[field] = saved[field]
 
 
 def _saved_metadata_object(path: Path) -> Optional[Dict]:
@@ -171,15 +185,7 @@ def _merge_metadata_records(new_record: Dict, saved: Dict) -> Dict:
     """Merge a new record with the metadata.json object saved for the same name."""
     if new_record.get("inspected"):
         merged = dict(new_record)
-        for field in (
-            "description",
-            "dependencies",
-            "credentials_needed",
-            "url",
-            "source",
-        ):
-            if _metadata_value_empty(new_record.get(field)) and field in saved:
-                merged[field] = saved[field]
+        _preserve_saved_when_empty(merged, new_record, saved)
         if "discovered_at" in saved:
             merged["discovered_at"] = saved["discovered_at"]
         return merged
@@ -196,8 +202,29 @@ def _merge_metadata_records(new_record: Dict, saved: Dict) -> Dict:
         ):
             if field in saved:
                 merged[field] = saved[field]
+        _preserve_saved_when_empty(merged, new_record, saved)
         return merged
-    return dict(new_record)
+    merged = dict(new_record)
+    _preserve_saved_when_empty(merged, new_record, saved)
+    return merged
+
+
+def _read_registry_index(path: Path):
+    """Load a registry index, or raise ValueError with the sentence callers print."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError, RecursionError):
+        raise ValueError(
+            "The registry index is not valid JSON: %s. Move it aside and run discover again."
+            % path
+        )
+    if not isinstance(data, dict) or not isinstance(data.get("mcps", []), list):
+        raise ValueError(
+            "The registry index is not in the expected shape: %s. Move it aside and run discover again."
+            % path
+        )
+    return data
 
 
 def safe_child(root: Path, name: str) -> Path:
@@ -472,7 +499,7 @@ class MCMEngine:
                 latest_version = dist_tags.get("latest")
             versions = npm_data.get("versions")
         if (
-            latest_version is None
+            not isinstance(latest_version, str)
             or not isinstance(versions, dict)
             or latest_version not in versions
             or not isinstance(versions.get(latest_version), dict)
@@ -560,19 +587,11 @@ class MCMEngine:
         registry_root = self.mcm_home / "registry"
         index_file = registry_root / "index.json"
         if index_file.exists():
-            try:
-                with open(index_file) as f:
-                    index = json.load(f)
-            except json.JSONDecodeError:
-                raise ValueError(
-                    f"the registry index is not valid JSON: {index_file}"
-                )
+            index = _read_registry_index(index_file)
         else:
             index = {"mcps": [], "updated_at": ""}
 
         mcps = index.get("mcps", [])
-        if not isinstance(mcps, list):
-            mcps = []
         index["mcps"] = mcps
 
         registry_dir = safe_child(registry_root, metadata.name)
@@ -657,6 +676,8 @@ def _strip_controls(text: str) -> str:
 def _numeric_count(value):
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return 0
+    if not math.isfinite(value):
+        return 0
     return value
 
 
@@ -670,12 +691,43 @@ def _stored_description(value):
     return value
 
 
-def _inspect_env() -> Dict[str, str]:
+_PROXY_ENV_KEYS = (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+)
+
+
+def _proxy_value_withheld(value: str) -> bool:
+    """Return true when this proxy value must not be passed on."""
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        # "user:pw@host:port" has no scheme, but urlsplit reports one.
+        # A value with no "://" is parsed as if "http://" were in front.
+        if parsed.scheme == "" or "://" not in value:
+            parsed = urllib.parse.urlsplit("http://" + value)
+        username = parsed.username
+        password = parsed.password
+    except ValueError:
+        return True
+    return username is not None or password is not None
+
+
+def _inspect_env() -> Tuple[Dict[str, str], List[str]]:
     env = {}  # type: Dict[str, str]
+    withheld = []  # type: List[str]
     for key in _INSPECT_ENV_KEYS:
-        if key in os.environ:
-            env[key] = os.environ[key]
-    return env
+        if key not in os.environ:
+            continue
+        value = os.environ[key]
+        if key in _PROXY_ENV_KEYS and _proxy_value_withheld(value):
+            withheld.append(key)
+            continue
+        env[key] = value
+    return (env, withheld)
 
 
 def _read_stderr_tail(path: str) -> str:
@@ -770,6 +822,11 @@ def inspect_command(
     proc = None
     stderr_fh = None
     try:
+        env, withheld = _inspect_env()
+        if notes is not None and withheld:
+            notes.append(
+                "a proxy setting that holds a user name or password was not passed to the server"
+            )
         stderr_path = os.path.join(work.name, "stderr.txt")
         stderr_fh = open(stderr_path, "wb")
         proc = subprocess.Popen(
@@ -778,7 +835,7 @@ def inspect_command(
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=stderr_fh,
-            env=_inspect_env(),
+            env=env,
             start_new_session=True,
         )
         try:
@@ -1021,16 +1078,23 @@ def _cmd_inspect(engine: "MCMEngine"):
         f"Starting npx -y {package} in a temporary folder; it is stopped after {INSPECT_TIMEOUT} seconds."
     )
     notes = []  # type: List[str]
+
+    def write_notes():
+        for note in notes:
+            print("Note: %s" % note)
+
     try:
         tools, context_tokens = inspect_command(
             ["npx", "-y", package] + server_args,
             notes=notes,
         )
     except InspectError as exc:
+        write_notes()
         print(f"Error: {exc}")
         sys.exit(1)
     except OSError as exc:
-        print("Error: could not start npx (%s)" % exc)
+        write_notes()
+        print("Error: inspect could not run (%s)" % exc)
         sys.exit(1)
 
     now = utc_now_iso()
@@ -1060,8 +1124,7 @@ def _cmd_inspect(engine: "MCMEngine"):
     )
     for tool in tools:
         print(f"  - {tool['name']} (schema {tool['schema_size']} characters)")
-    for note in notes:
-        print(f"Note: {note}")
+    write_notes()
 
 
 def scan_claude_config(project_dir: Path, home: Path) -> Tuple[List[str], List[str]]:
@@ -1226,23 +1289,10 @@ def main():
             print("No MCPs discovered yet.")
             sys.exit(1)
 
-        invalid_index = False
         try:
-            with open(index_file) as f:
-                index = json.load(f)
-        except json.JSONDecodeError:
-            invalid_index = True
-            index = None
-        if not invalid_index and (
-            not isinstance(index, dict)
-            or not isinstance(index.get("mcps", []), list)
-        ):
-            invalid_index = True
-        if invalid_index:
-            print(
-                "The registry index is not valid JSON: %s. Move it aside and run discover again."
-                % index_file
-            )
+            index = _read_registry_index(index_file)
+        except ValueError as exc:
+            print(exc)
             sys.exit(1)
 
         mcps = index.get("mcps", [])
