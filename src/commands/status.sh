@@ -1,6 +1,8 @@
 #!/bin/bash
 # MCM Status - Show current MCM state
 
+set -euo pipefail
+
 MCM_HOME="${MCM_HOME:-$HOME/.mcm}"
 
 if [[ ! -d "$MCM_HOME" ]]; then
@@ -17,10 +19,42 @@ if [[ -f "$MCM_HOME/registry/index.json" ]]; then
     echo ""
     python3 - "$MCM_HOME/registry/index.json" <<'PY'
 import json
+import math
 import sys
 
-with open(sys.argv[1]) as handle:
-    data = json.load(handle)
+def as_count(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    if not math.isfinite(value):
+        return 0
+    return value
+
+
+def invalid(path):
+    print(
+        "The registry index is not valid JSON: %s. Move it aside and run discover again."
+        % path
+    )
+    sys.exit(1)
+
+
+def bad_shape(path):
+    print(
+        "The registry index is not in the expected shape: %s. Move it aside and run discover again."
+        % path
+    )
+    sys.exit(1)
+
+
+path = sys.argv[1]
+try:
+    with open(path, encoding="utf-8") as handle:
+        data = json.load(handle)
+except (OSError, ValueError, RecursionError):
+    invalid(path)
+
+if not isinstance(data, dict) or not isinstance(data.get("mcps", []), list):
+    bad_shape(path)
 
 mcps = data.get("mcps", [])
 print("Discovered MCPs: %d" % len(mcps))
@@ -30,10 +64,12 @@ inspected = 0
 tool_total = 0
 token_total = 0
 for mcp in mcps:
+    if not isinstance(mcp, dict):
+        continue
     name = mcp.get("name", "")
     if mcp.get("inspected"):
-        tool_count = mcp.get("tool_count", 0)
-        context_tokens = mcp.get("context_tokens", 0)
+        tool_count = as_count(mcp.get("tool_count", 0))
+        context_tokens = as_count(mcp.get("context_tokens", 0))
         inspected += 1
         tool_total += tool_count
         token_total += context_tokens

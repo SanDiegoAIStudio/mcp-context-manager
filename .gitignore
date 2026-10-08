@@ -2,7 +2,6 @@
 
 # User-specific files (DO NOT COMMIT)
 *.env
-credentials.env
 .mcm-config.local.json
 
 # Python

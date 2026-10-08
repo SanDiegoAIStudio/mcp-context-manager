@@ -3,13 +3,13 @@
 **Experimental MCP discovery, inspection, and offline context organization for Claude Code**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 
 ---
 
 ## 🎯 The Problem
 
-Model Context Protocol (MCP) servers extend Claude Code with powerful tools — but as the MCP ecosystem grows, **users lose visibility and control**.
+Model Context Protocol (MCP) servers extend Claude Code with powerful tools, but as the MCP ecosystem grows, **users lose visibility and control**.
 
 Once you enable multiple MCPs, it becomes difficult to answer basic questions:
 
@@ -50,7 +50,7 @@ MCM is an **inspection and organization layer**, not a runtime optimizer.
 
 ---
 
-## ✨ What MCM Actually Does
+## ✨ What MCM Does
 
 ### One-time setup
 
@@ -62,7 +62,7 @@ MCM is an **inspection and organization layer**, not a runtime optimizer.
 
 * MCPs are **discovered and indexed**, not loaded as tools
 * Tool schemas are summarized and stored locally
-* You can search, review, and compare MCP capabilities
+* `status` and `validate` list what was saved, so you can review servers side by side
 * Large MCP definitions don’t need to live in your prompt history
 
 Think of MCM as an **MCP audit and exploration toolkit**.
@@ -104,8 +104,9 @@ In **Claude Code**, type:
 /mcm discover
 ```
 
-Paste MCP names, packages, or URLs (any format).
-MCM will analyze them and store results locally.
+Paste npm package names or GitHub repository URLs, one per line. MCM looks each one up and stores the details locally.
+
+Use the full package name, for example `@modelcontextprotocol/server-filesystem`. A plain name is looked up on npm exactly as written.
 
 From a terminal:
 
@@ -115,20 +116,46 @@ bash ~/.claude/scripts/mcm/main.sh discover @modelcontextprotocol/server-filesys
 
 Results land in `~/.mcm/registry/index.json`. `bash ~/.claude/scripts/mcm/main.sh status` lists them.
 
+Run `bash ~/.claude/scripts/mcm/main.sh discover` with no names in a terminal and it asks how you want to give it the list: paste it, point to a file, or scan your Claude config. The scan reads two files:
+
+- `.mcp.json` in the folder you run it from
+- `~/.claude.json`, both its own `mcpServers` and the `mcpServers` of each project listed in it
+
+It takes the package name from each server started with `npx` or `bunx`, shows you the names, and asks before it looks anything up. A server started another way is printed as skipped. When neither file names a server it can use, it prints `No MCP servers found in ./.mcp.json or ~/.claude.json` and exits with code 1.
+
 ## Inspect a server's tools
 
 - `mcm inspect <package>` starts the server with `npx -y` in a temporary folder, asks it for its tools, and stops it after 30 seconds at most.
 - The stop reaches the server and the processes it started, unless one of them starts its own session; such a process can keep running after inspect returns.
 - It prints "This runs <package>'s own code on your machine, the same as installing it." and asks before starting, unless you pass --yes.
-- It passes only PATH, HOME, USER, LANG and TMPDIR from your environment.
+- It passes only PATH, HOME, USER, LANG and TMPDIR from your environment, plus certificate settings (NODE_EXTRA_CA_CERTS, SSL_CERT_FILE, SSL_CERT_DIR), NO_PROXY, and proxy addresses (HTTP_PROXY, HTTPS_PROXY, ALL_PROXY) that carry no user name or password. The server can still read files under HOME, as any installed package can.
 - It saves tool names, descriptions cut to 200 characters and schema sizes.
 - Status and validate show real counts only for inspected servers and "not inspected" for the rest.
 - The token figure is the tool definitions' characters divided by 4.
+- A line of server output that is not JSON-RPC is ignored and counted, and inspect tells you how many there were.
 - If a first run times out while npx is still downloading the package, run it again.
 
 ```bash
 bash ~/.claude/scripts/mcm/main.sh inspect @modelcontextprotocol/server-filesystem -- /tmp
 ```
+
+## Uninstall
+
+`./install.sh` creates these and changes nothing else on your machine:
+
+- `~/.claude/commands/mcm.md`, the `/mcm` slash command
+- `~/.claude/scripts/mcm/`, holding `main.sh`, `discover.sh`, `status.sh`, `validate.sh` and `mcm_engine.py`
+- `~/.mcm/`, the workspace: the folders `config`, `registry`, `converted/skills`, `embeddings`, `analytics`, `cache`, `backups` and `logs`, the file `config/mcm-config.json` and the example list `cache/mcp-list-example.txt`
+
+To remove MCM:
+
+```bash
+rm ~/.claude/commands/mcm.md
+rm -r ~/.claude/scripts/mcm
+rm -r ~/.mcm
+```
+
+The last line also deletes what discover and inspect saved under `~/.mcm/registry/`; leave it out to keep that. If you installed with `MCM_HOME` set, the workspace is that folder instead of `~/.mcm`. `~/.claude/commands` and `~/.claude/scripts` are shared with other tools, so the steps above leave them in place.
 
 ---
 
@@ -146,9 +173,11 @@ This moves MCP reasoning from **prompt-time → offline-time**.
 
 ## What MCM sends
 
-* discover sends each name you give it to registry.npmjs.org. For a package whose repository is on GitHub, it sends the owner/repo to api.github.com (with GITHUB_TOKEN if you set it) and reads the repository's package.json from raw.githubusercontent.com.
+* discover sends each npm package name you give it to registry.npmjs.org and nowhere else.
+* For a GitHub repository URL, discover sends the owner/repo to api.github.com (with GITHUB_TOKEN if you set it) and reads the repository's package.json from raw.githubusercontent.com.
 * inspect sends nothing to MCM's lookups, and npx downloads the package from the npm registry.
 * MCM uses no search service. The only key it reads is GITHUB_TOKEN, and only for api.github.com.
+* Set GITHUB_TOKEN in your shell to raise GitHub's rate limit; MCM reads it from the environment and stores it nowhere.
 * Nothing else leaves your machine: no file contents, no paths and no config. Each request is printed as it happens.
 * A name must look like an npm package, a GitHub repository URL or a plain name; anything else is skipped and nothing is sent for it.
 * A redirect to another host is refused, so a token or key never follows one.
@@ -195,7 +224,7 @@ python3 -m unittest discover -s tests -v
 
 ## 📄 License
 
-MIT License — see [LICENSE](LICENSE) for details.
+MIT License. See [LICENSE](LICENSE) for details.
 
 
 

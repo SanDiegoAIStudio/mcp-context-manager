@@ -7,6 +7,7 @@ Handles discovery, analysis, conversion, and management of MCPs
 import os
 import sys
 import json
+import math
 import re
 import queue
 import shutil
@@ -16,6 +17,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -129,6 +131,97 @@ def http_error(label: str, status: int, text: str) -> Exception:
     if 300 <= status <= 399:
         return Exception(f"{label}: {status} (a redirect to another host was refused)")
     return Exception(f"{label}: {status}")
+
+
+def _write_json_atomic(path: Path, payload) -> None:
+    """Write JSON via a temp file in the same folder, then replace the target."""
+    folder = path.parent
+    folder.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=".mcm-tmp-", dir=str(folder))
+    try:
+        with os.fdopen(fd, "w") as handle:
+            json.dump(payload, handle, indent=2)
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def _metadata_value_empty(value) -> bool:
+    return value is None or value == "" or value == []
+
+
+def _preserve_saved_when_empty(merged: Dict, new_record: Dict, saved: Dict) -> None:
+    """Keep saved text fields when the new record leaves them empty."""
+    for field in (
+        "description",
+        "dependencies",
+        "credentials_needed",
+        "url",
+        "source",
+    ):
+        if _metadata_value_empty(new_record.get(field)) and field in saved:
+            merged[field] = saved[field]
+
+
+def _saved_metadata_object(path: Path) -> Optional[Dict]:
+    """Return metadata.json when it holds a JSON object, otherwise None."""
+    if not path.is_file():
+        return None
+    try:
+        with open(path) as handle:
+            data = json.load(handle)
+    except (UnicodeDecodeError, ValueError):
+        return None
+    if isinstance(data, dict):
+        return data
+    return None
+
+
+def _merge_metadata_records(new_record: Dict, saved: Dict) -> Dict:
+    """Merge a new record with the metadata.json object saved for the same name."""
+    if new_record.get("inspected"):
+        merged = dict(new_record)
+        _preserve_saved_when_empty(merged, new_record, saved)
+        if "discovered_at" in saved:
+            merged["discovered_at"] = saved["discovered_at"]
+        return merged
+    if saved.get("inspected"):
+        merged = dict(new_record)
+        for field in (
+            "tools",
+            "tool_count",
+            "complexity_score",
+            "context_cost_estimate",
+            "format",
+            "inspected",
+            "inspected_at",
+        ):
+            if field in saved:
+                merged[field] = saved[field]
+        return merged
+    return dict(new_record)
+
+
+def _read_registry_index(path: Path):
+    """Load a registry index, or raise ValueError with the sentence callers print."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError, RecursionError):
+        raise ValueError(
+            "The registry index is not valid JSON: %s. Move it aside and run discover again."
+            % path
+        )
+    if not isinstance(data, dict) or not isinstance(data.get("mcps", []), list):
+        raise ValueError(
+            "The registry index is not in the expected shape: %s. Move it aside and run discover again."
+            % path
+        )
+    return data
 
 
 def safe_child(root: Path, name: str) -> Path:
@@ -302,7 +395,11 @@ class MCMEngine:
                 return None
 
         except Exception as e:
-            self.log(f"Discovery failed for {mcp_info['identifier']}: {str(e)}", "error")
+            detail = _strip_controls(str(e))
+            self.log(
+                f"Discovery failed for {mcp_info['identifier']}: {detail}",
+                "error",
+            )
             return None
 
     def discover_from_github(self, mcp_info: Dict) -> Optional[MCPMetadata]:
@@ -330,32 +427,49 @@ class MCMEngine:
             raise http_error("GitHub API error", status, text)
 
         repo_data = json.loads(text)
+        repo_name = repo_data["name"]
+        if isinstance(repo_name, str):
+            repo_name = _strip_controls(repo_name)
 
-        # Extract package.json if exists
+        # Extract package.json if exists. Prefer the repository's default branch.
         print(f"  → raw.githubusercontent.com: {repo_path} package.json")
-        package_url = f"https://raw.githubusercontent.com/{repo_path}/main/package.json"
+        package_json = {}
+        branches = []
+        default_branch = repo_data.get("default_branch")
+        if isinstance(default_branch, str) and default_branch:
+            branches.append(urllib.parse.quote(default_branch, safe="/"))
+        for branch in ("main", "master"):
+            if branch not in branches:
+                branches.append(branch)
         try:
-            pkg_status, pkg_text = http_request("GET", package_url)
-            if pkg_status == 200:
-                package_json = json.loads(pkg_text)
-            else:
-                # Try master branch
-                package_url = f"https://raw.githubusercontent.com/{repo_path}/master/package.json"
+            for branch in branches:
+                package_url = (
+                    f"https://raw.githubusercontent.com/{repo_path}/{branch}/package.json"
+                )
                 pkg_status, pkg_text = http_request("GET", package_url)
-                package_json = json.loads(pkg_text) if pkg_status == 200 else {}
-        except:
+                if pkg_status == 200:
+                    loaded = json.loads(pkg_text)
+                    if isinstance(loaded, dict):
+                        package_json = loaded
+                    break
+        except Exception:
             package_json = {}
 
+        dependency_names = []
+        raw_dependencies = package_json.get("dependencies")
+        if isinstance(raw_dependencies, dict):
+            dependency_names = list(raw_dependencies.keys())
+
         metadata = MCPMetadata(
-            name=repo_data["name"],
+            name=repo_name,
             source="github",
             url=repo_data["html_url"],
-            description=repo_data.get("description", ""),
+            description=_stored_description(repo_data.get("description", "")),
             tools=[],
             tool_count=0,
             complexity_score=0.0,
             context_cost_estimate=0,
-            dependencies=list(package_json.get("dependencies", {}).keys()) if package_json else [],
+            dependencies=dependency_names,
             credentials_needed=self.detect_credentials([]),
             discovered_at=utc_now_iso(),
             format="direct"
@@ -374,43 +488,43 @@ class MCMEngine:
             raise http_error("NPM registry error", status, text)
 
         npm_data = json.loads(text)
-        latest_version = npm_data["dist-tags"]["latest"]
-        latest_data = npm_data["versions"][latest_version]
-
-        # Get repository URL
-        repo_url = latest_data.get("repository", {}).get("url", "")
-        if repo_url.startswith("git+"):
-            repo_url = repo_url[4:]
-        if repo_url.endswith(".git"):
-            repo_url = repo_url[:-4]
-
-        # If GitHub repo, analyze it
-        if "github.com" in repo_url:
-            github_path = repo_url.split("github.com/")[-1]
-            metadata = self.discover_from_github(
-                {"identifier": github_path, "type": "github_url"}
+        latest_version = None
+        versions = None
+        if isinstance(npm_data, dict):
+            dist_tags = npm_data.get("dist-tags")
+            if isinstance(dist_tags, dict):
+                latest_version = dist_tags.get("latest")
+            versions = npm_data.get("versions")
+        if (
+            not isinstance(latest_version, str)
+            or not isinstance(versions, dict)
+            or latest_version not in versions
+            or not isinstance(versions.get(latest_version), dict)
+        ):
+            raise Exception(
+                "npm registry answer for %s has no latest version" % package_name
             )
-            if metadata is not None:
-                metadata.name = package_name
-            return metadata
+        latest_data = versions[latest_version]
+        dependencies = latest_data.get("dependencies")
+        if isinstance(dependencies, dict):
+            dependency_names = list(dependencies.keys())
+        else:
+            dependency_names = []
 
-        # Otherwise create basic metadata
-        metadata = MCPMetadata(
-            name=npm_data["name"],
+        return MCPMetadata(
+            name=package_name,
             source="npm",
-            url=f"https://www.npmjs.com/package/{package_name}",
-            description=latest_data.get("description", ""),
+            url="https://www.npmjs.com/package/%s" % package_name,
+            description=_stored_description(latest_data.get("description", "")),
             tools=[],  # Would need to download and analyze
             tool_count=0,
             complexity_score=0.0,
             context_cost_estimate=0,
-            dependencies=list(latest_data.get("dependencies", {}).keys()),
+            dependencies=dependency_names,
             credentials_needed=[],
             discovered_at=utc_now_iso(),
             format="direct"
         )
-
-        return metadata
 
     def calculate_complexity(self, tools: List[Dict]) -> float:
         """Calculate complexity score for tools"""
@@ -470,55 +584,49 @@ class MCMEngine:
         registry_root = self.mcm_home / "registry"
         index_file = registry_root / "index.json"
         if index_file.exists():
-            with open(index_file) as f:
-                index = json.load(f)
+            index = _read_registry_index(index_file)
         else:
             index = {"mcps": [], "updated_at": ""}
 
-        existing_entry = None
-        for item in index.get("mcps", []):
-            if item.get("name") == metadata.name:
-                existing_entry = item
-                break
+        mcps = index.get("mcps", [])
+        index["mcps"] = mcps
 
-        keep_inspected = (
-            (not metadata.inspected)
-            and existing_entry is not None
-            and bool(existing_entry.get("inspected"))
-        )
+        registry_dir = safe_child(registry_root, metadata.name)
+        metadata_file = registry_dir / "metadata.json"
+        saved = _saved_metadata_object(metadata_file)
+        record = asdict(metadata)
+        if saved is not None:
+            record = _merge_metadata_records(record, saved)
 
-        if keep_inspected:
-            entry = dict(existing_entry)
-            entry["name"] = metadata.name
-            entry["source"] = metadata.source
-            entry["discovered_at"] = metadata.discovered_at
-        else:
-            registry_dir = safe_child(registry_root, metadata.name)
-            registry_dir.mkdir(parents=True, exist_ok=True)
+        registry_dir.mkdir(parents=True, exist_ok=True)
+        _write_json_atomic(metadata_file, record)
 
-            metadata_file = registry_dir / "metadata.json"
-            with open(metadata_file, "w") as f:
-                json.dump(asdict(metadata), f, indent=2)
+        entry = {
+            "name": record["name"],
+            "source": record["source"],
+            "tool_count": record["tool_count"],
+            "format": record["format"],
+            "discovered_at": record["discovered_at"],
+            "inspected": bool(record.get("inspected")),
+        }
+        if record.get("inspected"):
+            entry["context_tokens"] = record["context_cost_estimate"]
 
-            entry = {
-                "name": metadata.name,
-                "source": metadata.source,
-                "tool_count": metadata.tool_count,
-                "format": metadata.format,
-                "discovered_at": metadata.discovered_at,
-                "inspected": bool(metadata.inspected),
-            }
-            if metadata.inspected:
-                entry["context_tokens"] = metadata.context_cost_estimate
-
-        existing = [m for m in index["mcps"] if m["name"] != metadata.name]
+        existing = []
+        for item in index["mcps"]:
+            if (
+                isinstance(item, dict)
+                and isinstance(item.get("name"), str)
+                and item.get("name") == metadata.name
+            ):
+                continue
+            existing.append(item)
         existing.append(entry)
 
         index["mcps"] = existing
         index["updated_at"] = utc_now_iso()
 
-        with open(index_file, "w") as f:
-            json.dump(index, f, indent=2)
+        _write_json_atomic(index_file, index)
 
 
 class InspectError(Exception):
@@ -527,32 +635,101 @@ class InspectError(Exception):
 
 INSPECT_TIMEOUT = 30
 
-_INSPECT_ENV_KEYS = ("PATH", "HOME", "USER", "LANG", "TMPDIR")
+_INSPECT_ENV_KEYS = (
+    "PATH",
+    "HOME",
+    "USER",
+    "LANG",
+    "TMPDIR",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+    "all_proxy",
+    "NODE_EXTRA_CA_CERTS",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+)
 _MAX_TOOL_PAGES = 20
+_STDERR_TAIL_BYTES = 4096
 
 
 def _strip_controls(text: str) -> str:
     kept = []
     for ch in text:
         code = ord(ch)
-        if code < 32 or code == 127:
+        # Drop C0 controls (including escape), DEL, the C1 range, and format characters.
+        if code < 32 or code == 127 or 0x80 <= code <= 0x9F:
+            continue
+        if unicodedata.category(ch) == "Cf":
             continue
         kept.append(ch)
     return "".join(kept)
 
 
-def _inspect_env() -> Dict[str, str]:
+def _numeric_count(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    if not math.isfinite(value):
+        return 0
+    return value
+
+
+def _stored_description(value):
+    """Registry description safe to save. A null description is an empty string."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        spaced = value.replace("\r", " ").replace("\n", " ").replace("\t", " ")
+        return _strip_controls(spaced)
+    return value
+
+
+_PROXY_ENV_KEYS = (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+)
+
+
+def _proxy_value_withheld(value: str) -> bool:
+    """Return true when this proxy value must not be passed on.
+
+    A proxy address without credentials has no "@".
+    """
+    return "@" in value
+
+
+def _inspect_env() -> Tuple[Dict[str, str], List[str]]:
     env = {}  # type: Dict[str, str]
+    withheld = []  # type: List[str]
     for key in _INSPECT_ENV_KEYS:
-        if key in os.environ:
-            env[key] = os.environ[key]
-    return env
+        if key not in os.environ:
+            continue
+        value = os.environ[key]
+        if key in _PROXY_ENV_KEYS and _proxy_value_withheld(value):
+            withheld.append(key)
+            continue
+        env[key] = value
+    return (env, withheld)
 
 
 def _read_stderr_tail(path: str) -> str:
     try:
         with open(path, "rb") as handle:
-            data = handle.read()
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            if size > _STDERR_TAIL_BYTES:
+                handle.seek(size - _STDERR_TAIL_BYTES)
+            else:
+                handle.seek(0)
+            data = handle.read(_STDERR_TAIL_BYTES)
     except OSError:
         return ""
     return data.decode("utf-8", errors="replace")
@@ -596,13 +773,17 @@ def _clean_tools(raw_tools: List) -> List[Dict]:
         if not isinstance(entry, dict):
             continue
         name = entry.get("name")
-        if not isinstance(name, str) or name == "":
+        if not isinstance(name, str):
             continue
         name = _strip_controls(name)
+        if name == "":
+            continue
+        if len(name) > 200:
+            name = name[:200]
         description = entry.get("description", "")
         if not isinstance(description, str):
             description = ""
-        description = _strip_controls(description)[:200]
+        description = _stored_description(description)[:200]
         if "inputSchema" not in entry or entry.get("inputSchema") is None:
             schema_size = 0
         else:
@@ -622,13 +803,20 @@ def _clean_tools(raw_tools: List) -> List[Dict]:
 
 
 def inspect_command(
-    command: List[str], timeout: float = INSPECT_TIMEOUT
+    command: List[str],
+    timeout: float = INSPECT_TIMEOUT,
+    notes: Optional[List[str]] = None,
 ) -> Tuple[List[Dict], int]:
     """Start one MCP server and collect its tool names over stdio."""
     work = tempfile.TemporaryDirectory(prefix="mcm-inspect-")
     proc = None
     stderr_fh = None
     try:
+        env, withheld = _inspect_env()
+        if notes is not None and withheld:
+            notes.append(
+                "a proxy setting that holds a user name or password was not passed to the server"
+            )
         stderr_path = os.path.join(work.name, "stderr.txt")
         stderr_fh = open(stderr_path, "wb")
         proc = subprocess.Popen(
@@ -637,11 +825,11 @@ def inspect_command(
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=stderr_fh,
-            env=_inspect_env(),
+            env=env,
             start_new_session=True,
         )
         try:
-            return _inspect_exchange(proc, stderr_path, timeout)
+            return _inspect_exchange(proc, stderr_path, timeout, notes)
         finally:
             _stop_inspect_process(proc)
             proc = None
@@ -656,8 +844,14 @@ def inspect_command(
         work.cleanup()
 
 
-def _inspect_exchange(proc, stderr_path: str, timeout: float) -> Tuple[List[Dict], int]:
+def _inspect_exchange(
+    proc,
+    stderr_path: str,
+    timeout: float,
+    notes: Optional[List[str]] = None,
+) -> Tuple[List[Dict], int]:
     line_queue = queue.Queue()  # type: queue.Queue
+    skipped = [0]
 
     def reader():
         try:
@@ -675,9 +869,25 @@ def _inspect_exchange(proc, stderr_path: str, timeout: float) -> Tuple[List[Dict
     thread.start()
     deadline = time.monotonic() + timeout
 
+    def non_json_suffix():
+        count = skipped[0]
+        if count > 0:
+            return " (%d line(s) of its output were not JSON-RPC)" % count
+        return ""
+
+    def record_note():
+        count = skipped[0]
+        if notes is not None and count > 0:
+            notes.append(
+                "the server wrote %d line(s) to its output that are not JSON-RPC; they were ignored"
+                % count
+            )
+
     def timed_out():
+        record_note()
         raise InspectError(
-            "the server did not answer within %g seconds; it was stopped" % timeout
+            "the server did not answer within %g seconds; it was stopped%s. If npx was still downloading the package, run it again."
+            % (timeout, non_json_suffix())
         )
 
     def exited():
@@ -692,8 +902,12 @@ def _inspect_exchange(proc, stderr_path: str, timeout: float) -> Tuple[List[Dict
         message = "the server exited before answering (exit code %s)" % code
         err = _read_stderr_tail(stderr_path)
         if err:
-            message += " | " + err[-500:]
-        raise InspectError(message)
+            err = err.replace("\r\n", " | ").replace("\n", " | ").replace("\r", " | ")
+            err = _strip_controls(err)
+            if err:
+                message += " | " + err[-500:]
+        record_note()
+        raise InspectError(message + non_json_suffix())
 
     def send(payload: Dict):
         if time.monotonic() >= deadline:
@@ -723,19 +937,30 @@ def _inspect_exchange(proc, stderr_path: str, timeout: float) -> Tuple[List[Dict
                 continue
             try:
                 message = json.loads(text)
-            except ValueError:
-                raise InspectError("the server wrote a line that is not JSON-RPC")
-            if not isinstance(message, dict):
+            except (ValueError, RecursionError):
+                skipped[0] += 1
                 continue
-            if message.get("id") != expected_id:
+            if not isinstance(message, dict):
+                skipped[0] += 1
+                continue
+            msg_id = message.get("id")
+            if isinstance(msg_id, bool) or msg_id != expected_id:
+                continue
+            if "method" in message:
+                continue
+            if "result" not in message and "error" not in message:
                 continue
             error = message.get("error")
-            if error is not None:
+            if "error" in message and error is not None:
                 if not isinstance(error, dict):
                     error = {}
+                detail = error.get("message", "")
+                if not isinstance(detail, str):
+                    detail = "" if detail is None else str(detail)
+                record_note()
                 raise InspectError(
                     "the server answered %s with an error: %s"
-                    % (method, error.get("message", ""))
+                    % (method, _strip_controls(detail))
                 )
             return message.get("result")
 
@@ -776,12 +1001,19 @@ def _inspect_exchange(proc, stderr_path: str, timeout: float) -> Tuple[List[Dict
         result = wait_response(next_id, "tools/list")
         next_id += 1
         if not isinstance(result, dict) or not isinstance(result.get("tools"), list):
+            record_note()
             raise InspectError("the server's tools/list answer has no tools list")
         raw_tools.extend(result["tools"])
         cursor = result.get("nextCursor")
         if not isinstance(cursor, str):
+            cursor = None
             break
 
+    record_note()
+    if notes is not None and isinstance(cursor, str):
+        notes.append(
+            "the server has more than 20 pages of tools; only the first 20 pages were read"
+        )
     return (_clean_tools(raw_tools), _context_tokens(raw_tools))
 
 
@@ -823,7 +1055,11 @@ def _cmd_inspect(engine: "MCMEngine"):
         if not sys.stdin.isatty():
             print("Not started. Run it again with --yes to continue.")
             sys.exit(1)
-        answer = input("Continue? (y/n) ")
+        try:
+            answer = input("Continue? (y/n) ")
+        except EOFError:
+            print("Not started.")
+            sys.exit(1)
         if answer.strip().lower() not in ("y", "yes"):
             print("Not started.")
             sys.exit(1)
@@ -831,12 +1067,24 @@ def _cmd_inspect(engine: "MCMEngine"):
     print(
         f"Starting npx -y {package} in a temporary folder; it is stopped after {INSPECT_TIMEOUT} seconds."
     )
+    notes = []  # type: List[str]
+
+    def write_notes():
+        for note in notes:
+            print("Note: %s" % note)
+
     try:
         tools, context_tokens = inspect_command(
-            ["npx", "-y", package] + server_args
+            ["npx", "-y", package] + server_args,
+            notes=notes,
         )
     except InspectError as exc:
+        write_notes()
         print(f"Error: {exc}")
+        sys.exit(1)
+    except OSError as exc:
+        write_notes()
+        print("Error: inspect could not run (%s)" % exc)
         sys.exit(1)
 
     now = utc_now_iso()
@@ -856,12 +1104,17 @@ def _cmd_inspect(engine: "MCMEngine"):
         inspected=True,
         inspected_at=now,
     )
-    engine.save_metadata(metadata)
+    try:
+        engine.save_metadata(metadata)
+    except (ValueError, OSError) as exc:
+        print(f"Error: {package} was inspected but not saved ({exc})")
+        sys.exit(1)
     print(
         f"{package}: {len(tools)} tools, about {context_tokens} tokens of tool definitions"
     )
     for tool in tools:
         print(f"  - {tool['name']} (schema {tool['schema_size']} characters)")
+    write_notes()
 
 
 def scan_claude_config(project_dir: Path, home: Path) -> Tuple[List[str], List[str]]:
@@ -937,15 +1190,31 @@ def scan_claude_config(project_dir: Path, home: Path) -> Tuple[List[str], List[s
     return (packages, skipped)
 
 
+def _engine_usage():
+    return (
+        "Usage: mcm_engine.py <command> [args]\n"
+        "\n"
+        "Commands:\n"
+        "  discover <file>    Discover MCPs named in a file\n"
+        "  inspect <package>  Start a server and list its tools\n"
+        "  scan-config        Read MCP package names from Claude config\n"
+        "  list               List discovered MCPs"
+    )
+
+
 def main():
     """Main entry point"""
-    engine = MCMEngine()
-
-    if len(sys.argv) < 2:
-        print("Usage: mcm_engine.py <command> [args]")
-        sys.exit(1)
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+        print(_engine_usage())
+        sys.exit(0)
 
     command = sys.argv[1]
+    if command not in ("discover", "inspect", "scan-config", "list"):
+        print("Error: unknown command %s" % command)
+        print(_engine_usage())
+        sys.exit(1)
+
+    engine = MCMEngine()
 
     if command == "discover":
         if len(sys.argv) < 3:
@@ -953,8 +1222,12 @@ def main():
             sys.exit(1)
 
         mcp_list_file = sys.argv[2]
-        with open(mcp_list_file) as f:
-            mcp_text = f.read()
+        try:
+            with open(mcp_list_file) as f:
+                mcp_text = f.read()
+        except OSError:
+            print("Error: cannot read %s" % mcp_list_file)
+            sys.exit(1)
 
         mcps = engine.parse_mcp_input(mcp_text)
         print(f"Found {len(mcps)} MCPs to discover\n")
@@ -987,8 +1260,8 @@ def main():
             time.sleep(1)  # Rate limiting
 
         print(f"Discovered {ok} of {len(mcps)}")
-        if len(mcps) > 0 and ok == 0:
-            sys.exit(1)
+        if len(mcps) > 0 and ok < len(mcps):
+            sys.exit(1 if ok == 0 else 2)
 
     elif command == "inspect":
         _cmd_inspect(engine)
@@ -1003,15 +1276,26 @@ def main():
     elif command == "list":
         index_file = engine.mcm_home / "registry" / "index.json"
         if not index_file.exists():
-            print("No MCPs discovered yet. Run 'mcm discover' first.")
+            print("No MCPs discovered yet.")
             sys.exit(1)
 
-        with open(index_file) as f:
-            index = json.load(f)
+        try:
+            index = _read_registry_index(index_file)
+        except ValueError as exc:
+            print(exc)
+            sys.exit(1)
 
-        print(f"\nDiscovered MCPs ({len(index['mcps'])}):\n")
-        for mcp in index["mcps"]:
-            print(f"  • {mcp['name']}: {mcp['tool_count']} tools ({mcp['format']})")
+        mcps = index.get("mcps", [])
+        print(f"\nDiscovered MCPs ({len(mcps)}):\n")
+        for mcp in mcps:
+            if not isinstance(mcp, dict):
+                continue
+            name = mcp.get("name", "")
+            if isinstance(name, str):
+                name = _strip_controls(name)
+            tool_count = _numeric_count(mcp.get("tool_count", 0))
+            fmt = mcp.get("format", "")
+            print(f"  • {name}: {tool_count} tools ({fmt})")
 
 if __name__ == "__main__":
     main()
