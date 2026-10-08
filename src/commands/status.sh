@@ -14,18 +14,41 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 
 # Show discovered MCPs
 if [[ -f "$MCM_HOME/registry/index.json" ]]; then
-    MCP_COUNT=$(python3 -c "import json; f=open('$MCM_HOME/registry/index.json'); d=json.load(f); print(len(d.get('mcps', [])))")
     echo ""
-    echo "Discovered MCPs: $MCP_COUNT"
-    echo ""
-
-    python3 -c "
+    python3 - "$MCM_HOME/registry/index.json" <<'PY'
 import json
-with open('$MCM_HOME/registry/index.json') as f:
-    data = json.load(f)
-for mcp in data.get('mcps', []):
-    print(f\"  ✓ {mcp['name']:<20} {mcp['tool_count']:>3} tools → {mcp['format']}\")
-"
+import sys
+
+with open(sys.argv[1]) as handle:
+    data = json.load(handle)
+
+mcps = data.get("mcps", [])
+print("Discovered MCPs: %d" % len(mcps))
+print("")
+
+inspected = 0
+tool_total = 0
+token_total = 0
+for mcp in mcps:
+    name = mcp.get("name", "")
+    if mcp.get("inspected"):
+        tool_count = mcp.get("tool_count", 0)
+        context_tokens = mcp.get("context_tokens", 0)
+        inspected += 1
+        tool_total += tool_count
+        token_total += context_tokens
+        print(f"  ✓ {name:<40} {tool_count:>3} tools  ~{context_tokens} tokens")
+    else:
+        print(f"  · {name:<40} not inspected")
+
+if inspected == 0:
+    print("No server inspected yet. Run: mcm inspect <package>")
+else:
+    print(
+        "Inspected %d of %d: %d tools, about %d tokens of tool definitions."
+        % (inspected, len(mcps), tool_total, token_total)
+    )
+PY
 else
     echo "No MCPs discovered yet."
     echo "Run 'mcm discover' to get started."

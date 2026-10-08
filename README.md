@@ -115,6 +115,21 @@ bash ~/.claude/scripts/mcm/main.sh discover @modelcontextprotocol/server-filesys
 
 Results land in `~/.mcm/registry/index.json`. `bash ~/.claude/scripts/mcm/main.sh status` lists them.
 
+## Inspect a server's tools
+
+- `mcm inspect <package>` starts the server with `npx -y` in a temporary folder, asks it for its tools, and stops it after 30 seconds at most.
+- The stop reaches the server and the processes it started, unless one of them starts its own session; such a process can keep running after inspect returns.
+- It prints "This runs <package>'s own code on your machine, the same as installing it." and asks before starting, unless you pass --yes.
+- It passes only PATH, HOME, USER, LANG and TMPDIR from your environment.
+- It saves tool names, descriptions cut to 200 characters and schema sizes.
+- Status and validate show real counts only for inspected servers and "not inspected" for the rest.
+- The token figure is the tool definitions' characters divided by 4.
+- If a first run times out while npx is still downloading the package, run it again.
+
+```bash
+bash ~/.claude/scripts/mcm/main.sh inspect @modelcontextprotocol/server-filesystem -- /tmp
+```
+
 ---
 
 ## 📊 How It Works (High Level)
@@ -132,6 +147,7 @@ This moves MCP reasoning from **prompt-time → offline-time**.
 ## What MCM sends
 
 * discover sends each name you give it to registry.npmjs.org. For a package whose repository is on GitHub, it sends the owner/repo to api.github.com (with GITHUB_TOKEN if you set it) and reads the repository's package.json from raw.githubusercontent.com.
+* inspect sends nothing to MCM's lookups, and npx downloads the package from the npm registry.
 * MCM uses no search service. The only key it reads is GITHUB_TOKEN, and only for api.github.com.
 * Nothing else leaves your machine: no file contents, no paths and no config. Each request is printed as it happens.
 * A name must look like an npm package, a GitHub repository URL or a plain name; anything else is skipped and nothing is sent for it.
@@ -141,7 +157,7 @@ This moves MCP reasoning from **prompt-time → offline-time**.
 
 ## Known limits
 
-- discover saves a server's package and repository details, not its tools. Tool counts are not read yet.
+- discover saves package and repository details only. Real tool counts come from mcm inspect, which runs the server.
 
 ---
 
