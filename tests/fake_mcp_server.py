@@ -52,6 +52,12 @@ def ok_tools(mode):
             "description": "reports its environment",
             "inputSchema": SCHEMA,
         }
+    elif mode == "spacing":
+        first = {
+            "name": "spaced",
+            "description": "first\nsecond",
+            "inputSchema": SCHEMA,
+        }
     else:
         first = {
             "name": "read_file",
@@ -137,13 +143,17 @@ def serve_escape(pid_path):
 
 
 def serve_malformed():
+    sys.stdout.write("this is not json\n")
+    sys.stdout.flush()
+    serve_ok("ok")
+
+
+def serve_nonjson():
+    sys.stdout.write("this is not json\n")
+    sys.stdout.flush()
     while True:
-        msg = read_message()
-        if msg is None:
-            return
-        if msg.get("method") == "initialize":
-            sys.stdout.write("this is not json\n")
-            sys.stdout.flush()
+        line = sys.stdin.readline()
+        if line == "":
             return
 
 
@@ -172,18 +182,153 @@ def serve_exit():
     raise SystemExit(3)
 
 
+def serve_stderr_controls():
+    sys.stderr.buffer.write("\u001b[31mred\u009b\n".encode("utf-8"))
+    sys.stderr.buffer.flush()
+    raise SystemExit(3)
+
+
+def serve_endless():
+    page = 0
+    while True:
+        msg = read_message()
+        if msg is None:
+            return
+        method = msg.get("method")
+        mid = msg.get("id")
+        if method == "initialize":
+            initialize_result(mid)
+        elif method == "tools/list":
+            page += 1
+            write_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": mid,
+                    "result": {
+                        "tools": [{"name": "page-%d" % page}],
+                        "nextCursor": "more",
+                    },
+                }
+            )
+
+
+def serve_deep():
+    sys.stdout.write("[" * 100000 + "\n")
+    sys.stdout.flush()
+    serve_ok("ok")
+
+
+def serve_bool_id():
+    while True:
+        msg = read_message()
+        if msg is None:
+            return
+        method = msg.get("method")
+        mid = msg.get("id")
+        if method == "initialize":
+            write_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": True,
+                    "error": {"code": -32603, "message": "bool id"},
+                }
+            )
+            initialize_result(mid)
+        elif method == "tools/list":
+            write_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": mid,
+                    "result": {"tools": ok_tools("ok")},
+                }
+            )
+
+
+def serve_same_id_request():
+    while True:
+        msg = read_message()
+        if msg is None:
+            return
+        method = msg.get("method")
+        mid = msg.get("id")
+        if method == "initialize":
+            write_message({"jsonrpc": "2.0", "id": 1, "method": "ping"})
+            initialize_result(mid)
+        elif method == "tools/list":
+            write_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": mid,
+                    "method": "sampling/createMessage",
+                    "params": {},
+                }
+            )
+            write_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": mid,
+                    "result": {"tools": ok_tools("ok")},
+                }
+            )
+
+
+def serve_stale_id():
+    tools = ok_tools("ok")
+    while True:
+        msg = read_message()
+        if msg is None:
+            return
+        method = msg.get("method")
+        mid = msg.get("id")
+        if method == "initialize":
+            initialize_result(mid)
+        elif method == "tools/list":
+            write_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 99,
+                    "result": {
+                        "tools": [
+                            {
+                                "name": "wrong_tool",
+                                "description": "",
+                                "inputSchema": {},
+                            }
+                        ]
+                    },
+                }
+            )
+            write_message(
+                {"jsonrpc": "2.0", "id": mid, "result": {"tools": tools}}
+            )
+
+
 def main():
     if len(sys.argv) < 2:
         raise SystemExit(2)
     mode = sys.argv[1]
     if mode == "exit":
         serve_exit()
+    elif mode == "stderr_controls":
+        serve_stderr_controls()
+    elif mode == "same_id":
+        serve_same_id_request()
+    elif mode == "endless":
+        serve_endless()
+    elif mode == "deep":
+        serve_deep()
+    elif mode == "bool_id":
+        serve_bool_id()
+    elif mode == "stale_id":
+        serve_stale_id()
     elif mode == "silent":
         serve_silent(sys.argv[2])
     elif mode == "escape":
         serve_escape(sys.argv[2])
     elif mode == "malformed":
         serve_malformed()
+    elif mode == "nonjson":
+        serve_nonjson()
     elif mode == "error":
         serve_error()
     elif mode == "paged":
@@ -203,7 +348,7 @@ def main():
                 json.dumps({"cwd": os.getcwd(), "keys": sorted(os.environ)})
             )
         serve_ok(mode)
-    elif mode in ("ok", "ctrl"):
+    elif mode in ("ok", "ctrl", "spacing"):
         serve_ok(mode)
     else:
         raise SystemExit(2)

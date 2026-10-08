@@ -95,6 +95,40 @@ def install_copy(home):
     return claude_scripts
 
 
+def _run_with_pty_stdin(argv, cwd, env, typed):
+    """Run argv with typed text on a pseudo-terminal as stdin."""
+    import pty
+
+    master, slave = pty.openpty()
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            argv,
+            cwd=str(cwd),
+            env=env,
+            stdin=slave,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        os.close(slave)
+        slave = -1
+        payload = typed.encode("utf-8")
+        while payload:
+            written = os.write(master, payload)
+            payload = payload[written:]
+        captured, _stderr = proc.communicate(timeout=30)
+    except Exception:
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=30)
+        raise
+    finally:
+        if slave >= 0:
+            os.close(slave)
+        os.close(master)
+    return proc.returncode, captured.decode("utf-8")
+
+
 class FakeHTTPResponse(object):
     def __init__(self, status, body):
         self._status = status
@@ -214,6 +248,379 @@ class InstallScriptTests(IsolatedHomeTest):
         combined = proc.stdout + proc.stderr
         self.assertNotIn("\\033", combined)
         self.assertIn("Next steps:", combined)
+
+    def test_install_does_not_copy_second_installer(self):
+        """source: review: the root installer copied a legacy second installer"""
+        env = isolated_env(self.home)
+        proc = subprocess.run(
+            ["bash", str(REPO_ROOT / "install.sh")],
+            cwd=str(REPO_ROOT),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(
+            proc.returncode,
+            0,
+            "install.sh failed:\n%s\n%s" % (proc.stdout, proc.stderr),
+        )
+        scripts = Path(self.home) / ".claude" / "scripts" / "mcm"
+        self.assertTrue((scripts / "main.sh").is_file())
+        self.assertFalse((scripts / "install.sh").exists())
+
+    def test_install_creates_no_credentials_file(self):
+        """source: review: the installer created a world-readable token file that nothing reads"""
+        env = isolated_env(self.home)
+        proc = subprocess.run(
+            ["bash", str(REPO_ROOT / "install.sh")],
+            cwd=str(REPO_ROOT),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        combined = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 0, combined)
+        self.assertNotIn("credentials", combined)
+        token_file = "credentials" + ".env"
+        found = []
+        if self.mcm_home.exists():
+            for dirpath, _dirnames, filenames in os.walk(str(self.mcm_home)):
+                for filename in filenames:
+                    if filename == token_file:
+                        found.append(os.path.join(dirpath, filename))
+        self.assertEqual(found, [])
+
+    def test_repository_text_omits_credentials_file_name(self):
+        """source: review: the installer created a world-readable token file that nothing reads"""
+        needle = "credentials" + ".env"
+        offenders = []
+        for dirpath, dirnames, filenames in os.walk(str(REPO_ROOT)):
+            dirnames[:] = [name for name in dirnames if name != ".git"]
+            for filename in filenames:
+                path = os.path.join(dirpath, filename)
+                try:
+                    with open(path, "rb") as handle:
+                        data = handle.read()
+                except OSError:
+                    continue
+                if b"\0" in data:
+                    continue
+                try:
+                    text = data.decode("utf-8")
+                except UnicodeDecodeError:
+                    continue
+                if needle in text:
+                    offenders.append(path)
+        self.assertEqual(offenders, [])
+
+    def test_install_example_list_uses_real_package_names(self):
+        """source: the example list named a missing npm package, deprecated packages, and plain names discover looks up as unrelated packages"""
+        env = isolated_env(self.home)
+        proc = subprocess.run(
+            ["bash", str(REPO_ROOT / "install.sh")],
+            cwd=str(REPO_ROOT),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(
+            proc.returncode,
+            0,
+            "install.sh failed:\n%s\n%s" % (proc.stdout, proc.stderr),
+        )
+        example = (self.mcm_home / "cache" / "mcp-list-example.txt").read_text()
+        self.assertNotIn("server-playwright", example)
+        self.assertNotIn("server-slack", example)
+        lines = example.splitlines()
+        self.assertNotIn("github", lines)
+        self.assertNotIn("postgres", lines)
+        self.assertNotIn("filesystem", lines)
+        self.assertIn("@modelcontextprotocol/server-filesystem", example)
+        self.assertIn("@modelcontextprotocol/server-memory", example)
+        self.assertIn("@playwright/mcp", example)
+        engine_mod = load_engine(self.mcm_home)
+        engine = engine_mod.MCMEngine()
+        checked = 0
+        for line in lines:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            parsed = engine.parse_mcp_input(stripped + "\n")
+            self.assertEqual(len(parsed), 1, line)
+            self.assertNotEqual(parsed[0]["type"], "invalid", line)
+            checked += 1
+        self.assertGreater(checked, 0)
+        self.assertIn(
+            "3. Wait for discovery to finish (a few seconds per name)",
+            proc.stdout,
+        )
+
+    def test_readme_drops_any_format_search_and_long_dash(self):
+        """source: the README said discover takes any format and that you can search and compare"""
+        text = (REPO_ROOT / "README.md").read_text()
+        self.assertNotIn("(any format)", text)
+        self.assertNotIn("search, review, and compare", text)
+        self.assertNotIn("\u2014", text)
+
+    def test_readme_npm_discover_stays_on_the_registry(self):
+        """source: the README said an npm package's owner/repo is sent to api.github.com"""
+        text = (REPO_ROOT / "README.md").read_text()
+        self.assertIn(
+            "* discover sends each npm package name you give it to registry.npmjs.org and nowhere else.",
+            text,
+        )
+        self.assertIn(
+            "* For a GitHub repository URL, discover sends the owner/repo to api.github.com (with GITHUB_TOKEN if you set it) and reads the repository's package.json from raw.githubusercontent.com.",
+            text,
+        )
+        self.assertNotIn(
+            "For a package whose repository is on GitHub, it sends the owner/repo to api.github.com",
+            text,
+        )
+
+    def test_install_rejects_python_older_than_39(self):
+        """source: the installer accepted any python3, but the engine needs Python 3.9"""
+        bindir = self.tmp / "bin"
+        bindir.mkdir()
+        wrapper = bindir / "python3"
+        wrapper.write_text("#!/bin/bash\necho 'Python 3.8.10'\n")
+        os.chmod(str(wrapper), 0o755)
+        env = isolated_env(self.home)
+        env["PATH"] = str(bindir) + os.pathsep + env.get("PATH", "")
+        proc = subprocess.run(
+            ["bash", str(REPO_ROOT / "install.sh")],
+            cwd=str(REPO_ROOT),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        combined = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 1, combined)
+        self.assertIn(
+            "\u2717 Python 3.9 or newer is required (found 3.8.10)",
+            combined,
+        )
+        self.assertEqual(sorted(path.name for path in self.home.iterdir()), [])
+
+    def test_readme_requires_python_39_and_names_proxy_settings(self):
+        """source: the README required Python 3.10 and did not list proxy settings passed to npx"""
+        text = (REPO_ROOT / "README.md").read_text()
+        self.assertIn("python-3.9+-blue", text)
+        self.assertIn("Python 3.9+", text)
+        self.assertNotIn("python-3.10+", text)
+        self.assertNotIn("Python 3.10+", text)
+        self.assertIn(
+            "It passes only PATH, HOME, USER, LANG and TMPDIR from your environment, plus certificate settings (NODE_EXTRA_CA_CERTS, SSL_CERT_FILE, SSL_CERT_DIR), NO_PROXY, and proxy addresses (HTTP_PROXY, HTTPS_PROXY, ALL_PROXY) that carry no user name or password. The server can still read files under HOME, as any installed package can.",
+            text,
+        )
+
+    def test_readme_inspect_bullet_skips_proxy_credentials(self):
+        """source: the README said inspect passes every proxy setting that is set"""
+        text = (REPO_ROOT / "README.md").read_text()
+        self.assertIn(
+            "- It passes only PATH, HOME, USER, LANG and TMPDIR from your environment, plus certificate settings (NODE_EXTRA_CA_CERTS, SSL_CERT_FILE, SSL_CERT_DIR), NO_PROXY, and proxy addresses (HTTP_PROXY, HTTPS_PROXY, ALL_PROXY) that carry no user name or password. The server can still read files under HOME, as any installed package can.",
+            text,
+        )
+
+    def test_readme_uninstall_matches_what_the_installer_creates(self):
+        """source: the README named no way to remove MCM; its list must match what install.sh creates"""
+        env = isolated_env(self.home)
+        proc = subprocess.run(
+            ["bash", str(REPO_ROOT / "install.sh")],
+            cwd=str(REPO_ROOT),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(
+            proc.returncode,
+            0,
+            "install.sh failed:\n%s\n%s" % (proc.stdout, proc.stderr),
+        )
+
+        readme_lines = (REPO_ROOT / "README.md").read_text().splitlines()
+        start = None
+        for index, line in enumerate(readme_lines):
+            if line == "## Uninstall":
+                start = index
+                break
+        if start is None:
+            self.fail(
+                "README.md has no Uninstall section: no line is exactly '## Uninstall'"
+            )
+        end = len(readme_lines)
+        for index in range(start + 1, len(readme_lines)):
+            line = readme_lines[index]
+            if line.startswith("## ") or line == "---":
+                end = index
+                break
+        section = readme_lines[start:end]
+        section_text = "\n".join(section)
+
+        self.assertIn("`~/.claude/commands/mcm.md`", section_text)
+        command_path = self.home / ".claude" / "commands" / "mcm.md"
+        self.assertTrue(
+            command_path.is_file(),
+            "installer did not create %s" % command_path,
+        )
+
+        script_lines = [
+            line
+            for line in section
+            if line.startswith("- `~/.claude/scripts/mcm/`")
+        ]
+        self.assertEqual(
+            len(script_lines),
+            1,
+            "Uninstall section should have one scripts line, found %r" % (script_lines,),
+        )
+        script_names = set(
+            name
+            for name in re.findall(r"`([^`]*)`", script_lines[0])
+            if name.endswith(".sh") or name.endswith(".py")
+        )
+        scripts_dir = self.home / ".claude" / "scripts" / "mcm"
+        self.assertTrue(scripts_dir.is_dir(), "installer did not create %s" % scripts_dir)
+        present_scripts = set(
+            name
+            for name in os.listdir(str(scripts_dir))
+            if os.path.isfile(os.path.join(str(scripts_dir), name))
+        )
+        self.assertEqual(script_names, present_scripts)
+
+        workspace_lines = [
+            line for line in section if line.startswith("- `~/.mcm/`")
+        ]
+        self.assertEqual(
+            len(workspace_lines),
+            1,
+            "Uninstall section should have one workspace line, found %r"
+            % (workspace_lines,),
+        )
+        folder_names = set()
+        file_names = set()
+        mcm_root = self.home / ".mcm"
+        for name in re.findall(r"`([^`]*)`", workspace_lines[0]):
+            if name.startswith("~"):
+                continue
+            if "." in name:
+                file_names.add(name)
+                continue
+            if "/" in name:
+                folder_names.add(name.split("/", 1)[0])
+                nested = mcm_root / name
+                self.assertTrue(
+                    nested.is_dir(),
+                    "README names nested folder %s but it was not created" % name,
+                )
+            else:
+                folder_names.add(name)
+        present_folders = set(
+            name
+            for name in os.listdir(str(mcm_root))
+            if os.path.isdir(os.path.join(str(mcm_root), name))
+        )
+        self.assertEqual(folder_names, present_folders)
+        present_files = set()
+        for dirpath, _dirnames, filenames in os.walk(str(mcm_root)):
+            for name in filenames:
+                full = os.path.join(dirpath, name)
+                if os.path.islink(full) or not os.path.isfile(full):
+                    continue
+                present_files.add(
+                    os.path.relpath(full, str(mcm_root)).replace(os.sep, "/")
+                )
+        self.assertEqual(file_names, present_files)
+
+        for dirpath, _dirnames, filenames in os.walk(str(self.home)):
+            for name in filenames:
+                full = os.path.join(dirpath, name)
+                if os.path.islink(full) or not os.path.isfile(full):
+                    continue
+                rel = os.path.relpath(full, str(self.home)).replace(os.sep, "/")
+                under_command = rel == ".claude/commands/mcm.md" or rel.startswith(
+                    ".claude/commands/mcm.md/"
+                )
+                under_scripts = rel == ".claude/scripts/mcm" or rel.startswith(
+                    ".claude/scripts/mcm/"
+                )
+                under_workspace = rel == ".mcm" or rel.startswith(".mcm/")
+                self.assertTrue(
+                    under_command or under_scripts or under_workspace,
+                    "installer created %s outside the Uninstall paths" % rel,
+                )
+
+        fences = [
+            index for index, line in enumerate(section) if line.startswith("```")
+        ]
+        self.assertEqual(
+            len(fences),
+            2,
+            "Uninstall section should hold one fenced block, found %d fence lines"
+            % len(fences),
+        )
+        commands = [
+            line
+            for line in section[fences[0] + 1:fences[1]]
+            if line.strip() != ""
+        ]
+        self.assertEqual(
+            len(commands),
+            3,
+            "Uninstall fenced block should hold exactly three non-empty lines, found %r"
+            % (commands,),
+        )
+        home_real = os.path.realpath(str(self.home))
+        for line in commands:
+            matched = re.fullmatch(r"rm( -r)? (\S+)", line)
+            if matched is None:
+                self.fail(
+                    "Uninstall command must be 'rm <path>' or 'rm -r <path>', got %r"
+                    % (line,)
+                )
+            raw_path = matched.group(2)
+            self.assertTrue(
+                raw_path.startswith("~/"),
+                "uninstall path must start with '~/', got %r" % (raw_path,),
+            )
+            expanded = str(self.home) + raw_path[1:]
+            expanded_real = os.path.realpath(expanded)
+            self.assertTrue(
+                expanded_real.startswith(home_real + os.sep),
+                "refusing to remove %s (realpath %s), which is not inside %s"
+                % (expanded, expanded_real, home_real),
+            )
+            if matched.group(1) is None:
+                argv = ["rm", expanded]
+            else:
+                argv = ["rm", "-r", expanded]
+            removed = subprocess.run(argv, capture_output=True, text=True)
+            self.assertEqual(
+                removed.returncode,
+                0,
+                "uninstall command failed: %s\n%s%s"
+                % (argv, removed.stdout, removed.stderr),
+            )
+
+        left_dirs = []
+        for dirpath, _dirnames, filenames in os.walk(str(self.home)):
+            for name in filenames:
+                full = os.path.join(dirpath, name)
+                if os.path.islink(full) or not os.path.isfile(full):
+                    continue
+                self.fail("regular file left after uninstall: %s" % full)
+            rel = os.path.relpath(dirpath, str(self.home)).replace(os.sep, "/")
+            if rel != ".":
+                left_dirs.append(rel)
+        self.assertEqual(
+            set(left_dirs),
+            {".claude", ".claude/commands", ".claude/scripts"},
+        )
 
 
 class ParseMcpInputTests(IsolatedHomeTest):
@@ -622,6 +1029,592 @@ class NpmDiscoverTests(IsolatedHomeTest):
             buf.getvalue(),
         )
 
+    def _read_json_object(self, path):
+        try:
+            data = json.loads(Path(path).read_text())
+        except Exception as exc:
+            self.fail("%s is not valid JSON: %r" % (path, exc))
+        self.assertIsInstance(data, dict)
+        return data
+
+    def _inspected_metadata(self, engine_mod, name, tools, tokens, at):
+        return engine_mod.MCPMetadata(
+            name=name,
+            source="npm",
+            url="https://www.npmjs.com/package/" + name,
+            description="",
+            tools=tools,
+            tool_count=len(tools),
+            complexity_score=float(len(tools)),
+            context_cost_estimate=tokens,
+            dependencies=[],
+            credentials_needed=[],
+            discovered_at=at,
+            format="cli",
+            inspected=True,
+            inspected_at=at,
+        )
+
+    def test_discover_from_npm_github_repository_asks_only_the_registry(self):
+        """source: discover fetched a GitHub repository for an npm package and saved the monorepo, not the package"""
+        engine_mod = load_engine(self.mcm_home)
+        package_name = "@modelcontextprotocol/server-filesystem"
+        description = "Filesystem MCP server"
+        dependencies = ["zod", "diff"]
+        npm_doc = {
+            "name": "servers",
+            "dist-tags": {"latest": "1.2.3"},
+            "versions": {
+                "1.2.3": {
+                    "description": description,
+                    "repository": {
+                        "type": "git",
+                        "url": "git+https://github.com/modelcontextprotocol/servers.git",
+                    },
+                    "dependencies": {"zod": "^3.22.4", "diff": "^5.1.0"},
+                }
+            },
+        }
+        recorded = []
+
+        def fake_http(method, url, headers=None, json_body=None, timeout=30):
+            recorded.append(url)
+            if url == "https://registry.npmjs.org/" + package_name:
+                return (200, json.dumps(npm_doc))
+            return (500, url)
+
+        engine = engine_mod.MCMEngine()
+        with patch.object(engine_mod, "http_request", side_effect=fake_http):
+            try:
+                metadata = engine.discover_from_npm(
+                    {"identifier": package_name, "type": "npm_official"}
+                )
+            except Exception as exc:
+                self.fail("discover_from_npm raised %r" % (exc,))
+        self.assertEqual(
+            recorded,
+            ["https://registry.npmjs.org/" + package_name],
+        )
+        self.assertEqual(metadata.name, package_name)
+        self.assertEqual(metadata.source, "npm")
+        self.assertEqual(
+            metadata.url,
+            "https://www.npmjs.com/package/" + package_name,
+        )
+        self.assertEqual(metadata.description, description)
+        self.assertEqual(metadata.dependencies, dependencies)
+        self.assertEqual(metadata.format, "direct")
+        try:
+            engine.save_metadata(metadata)
+        except Exception as exc:
+            self.fail("save_metadata raised %r" % (exc,))
+        saved = self._read_json_object(
+            self.mcm_home
+            / "registry"
+            / "@modelcontextprotocol"
+            / "server-filesystem"
+            / "metadata.json"
+        )
+        self.assertEqual(saved["name"], package_name)
+        self.assertEqual(saved["description"], description)
+        self.assertEqual(saved["dependencies"], dependencies)
+
+    def test_discover_from_npm_string_and_shorthand_repository_ask_only_the_registry(self):
+        """source: an npm repository string or github: shorthand was sent to api.github.com"""
+        engine_mod = load_engine(self.mcm_home)
+        engine = engine_mod.MCMEngine()
+        cases = (
+            (
+                "string-repo",
+                "https://github.com/owner/repo.git",
+                "Description from the string repository package",
+            ),
+            (
+                "shorthand-repo",
+                "github:owner/repo",
+                "Description from the shorthand repository package",
+            ),
+        )
+        for package_name, repository, description in cases:
+            npm_doc = {
+                "name": "monorepo",
+                "dist-tags": {"latest": "1.0.0"},
+                "versions": {
+                    "1.0.0": {
+                        "description": description,
+                        "repository": repository,
+                        "dependencies": {"left-pad": "1.0.0"},
+                    }
+                },
+            }
+            recorded = []
+
+            def fake_http(
+                method,
+                url,
+                headers=None,
+                json_body=None,
+                timeout=30,
+                _recorded=recorded,
+                _doc=npm_doc,
+                _name=package_name,
+            ):
+                _recorded.append(url)
+                if url == "https://registry.npmjs.org/" + _name:
+                    return (200, json.dumps(_doc))
+                return (500, url)
+
+            with patch.object(engine_mod, "http_request", side_effect=fake_http):
+                try:
+                    metadata = engine.discover_from_npm(
+                        {"identifier": package_name, "type": "npm_package"}
+                    )
+                except Exception as exc:
+                    self.fail(
+                        "discover_from_npm raised %r for %s" % (exc, package_name)
+                    )
+            self.assertEqual(
+                recorded,
+                ["https://registry.npmjs.org/" + package_name],
+                package_name,
+            )
+            self.assertEqual(metadata.name, package_name, package_name)
+            self.assertEqual(metadata.source, "npm", package_name)
+            self.assertEqual(metadata.description, description, package_name)
+            self.assertEqual(metadata.dependencies, ["left-pad"], package_name)
+            try:
+                engine.save_metadata(metadata)
+            except Exception as exc:
+                self.fail("save_metadata raised %r for %s" % (exc, package_name))
+            saved = self._read_json_object(
+                self.mcm_home / "registry" / package_name / "metadata.json"
+            )
+            self.assertEqual(saved["description"], description, package_name)
+            self.assertEqual(saved["dependencies"], ["left-pad"], package_name)
+
+    def test_discover_from_npm_missing_latest_reports_the_package(self):
+        """source: an npm registry answer with no latest version raised KeyError instead of naming the package"""
+        engine_mod = load_engine(self.mcm_home)
+        engine = engine_mod.MCMEngine()
+        answers = (
+            {"name": "demo-mcp"},
+            {
+                "name": "demo-mcp",
+                "dist-tags": {"latest": "9.9.9"},
+                "versions": {"1.0.0": {"description": "present"}},
+            },
+        )
+        expected = "npm registry answer for demo-mcp has no latest version"
+        for npm_doc in answers:
+            def fake_http(
+                method,
+                url,
+                headers=None,
+                json_body=None,
+                timeout=30,
+                _doc=npm_doc,
+            ):
+                return (200, json.dumps(_doc))
+
+            with patch.object(engine_mod, "http_request", side_effect=fake_http):
+                with self.assertRaises(Exception) as ctx:
+                    engine.discover_from_npm(
+                        {"identifier": "demo-mcp", "type": "npm_package"}
+                    )
+            self.assertEqual(type(ctx.exception), Exception)
+            self.assertEqual(str(ctx.exception), expected)
+
+    def test_discover_from_npm_latest_list_has_no_latest_version(self):
+        """source: a dist-tags latest that was a list raised TypeError instead of reporting no latest version"""
+        engine_mod = load_engine(self.mcm_home)
+        engine = engine_mod.MCMEngine()
+        npm_doc = {
+            "name": "demo-mcp",
+            "dist-tags": {"latest": ["1.0.0"]},
+            "versions": {"1.0.0": {"description": "present"}},
+        }
+
+        def fake_http(method, url, headers=None, json_body=None, timeout=30):
+            return (200, json.dumps(npm_doc))
+
+        with patch.object(engine_mod, "http_request", side_effect=fake_http):
+            with self.assertRaises(Exception) as ctx:
+                engine.discover_from_npm(
+                    {"identifier": "demo-mcp", "type": "npm_package"}
+                )
+        self.assertEqual(type(ctx.exception), Exception)
+        self.assertIn("has no latest version", str(ctx.exception))
+
+    def test_discover_then_inspect_keeps_description_and_tools(self):
+        """source: inspect saved an empty description and empty dependencies, wiping what discover had saved"""
+        engine_mod = load_engine(self.mcm_home)
+        package_name = "demo-mcp"
+        description = "Package description from npm"
+        dependencies = ["zod"]
+        npm_doc = {
+            "name": "servers",
+            "dist-tags": {"latest": "1.0.0"},
+            "versions": {
+                "1.0.0": {
+                    "description": description,
+                    "repository": {
+                        "type": "git",
+                        "url": "git+https://github.com/modelcontextprotocol/servers.git",
+                    },
+                    "dependencies": {"zod": "3.22.4"},
+                }
+            },
+        }
+
+        def fake_http(method, url, headers=None, json_body=None, timeout=30):
+            if url == "https://registry.npmjs.org/" + package_name:
+                return (200, json.dumps(npm_doc))
+            return (500, url)
+
+        engine = engine_mod.MCMEngine()
+        with patch.object(engine_mod, "http_request", side_effect=fake_http):
+            try:
+                discovered = engine.discover_from_npm(
+                    {"identifier": package_name, "type": "npm_package"}
+                )
+            except Exception as exc:
+                self.fail("discover_from_npm raised %r" % (exc,))
+        try:
+            engine.save_metadata(discovered)
+        except Exception as exc:
+            self.fail("discover save_metadata raised %r" % (exc,))
+        tools = [
+            {"name": "read_file", "description": "Read a file", "schema_size": 42}
+        ]
+        inspected = self._inspected_metadata(
+            engine_mod,
+            package_name,
+            tools,
+            180,
+            "2024-05-01T00:00:00Z",
+        )
+        try:
+            engine.save_metadata(inspected)
+        except Exception as exc:
+            self.fail("inspect save_metadata raised %r" % (exc,))
+        saved = self._read_json_object(
+            self.mcm_home / "registry" / package_name / "metadata.json"
+        )
+        self.assertEqual(saved.get("description"), description)
+        self.assertEqual(saved.get("dependencies"), dependencies)
+        self.assertEqual(saved["tools"], tools)
+        self.assertTrue(saved["inspected"])
+        self.assertEqual(saved["tool_count"], 1)
+        self.assertEqual(saved["format"], "cli")
+        self.assertEqual(saved["context_cost_estimate"], 180)
+        self.assertEqual(saved["discovered_at"], discovered.discovered_at)
+        self.assertEqual(saved["inspected_at"], "2024-05-01T00:00:00Z")
+        index = self._read_json_object(self.mcm_home / "registry" / "index.json")
+        matches = [
+            item for item in index["mcps"] if item.get("name") == package_name
+        ]
+        self.assertEqual(len(matches), 1)
+        entry = matches[0]
+        self.assertTrue(entry["inspected"])
+        self.assertEqual(entry["tool_count"], 1)
+        self.assertEqual(entry["context_tokens"], 180)
+
+    def test_inspect_then_discover_keeps_tools_and_gains_npm_details(self):
+        """source: a discover after an inspect was dropped, so the description never arrived"""
+        engine_mod = load_engine(self.mcm_home)
+        package_name = "demo-mcp"
+        description = "Package description from npm"
+        dependencies = ["zod"]
+        tools = [
+            {"name": "read_file", "description": "Read a file", "schema_size": 42}
+        ]
+        npm_doc = {
+            "name": "servers",
+            "dist-tags": {"latest": "1.0.0"},
+            "versions": {
+                "1.0.0": {
+                    "description": description,
+                    "repository": {
+                        "type": "git",
+                        "url": "git+https://github.com/modelcontextprotocol/servers.git",
+                    },
+                    "dependencies": {"zod": "3.22.4"},
+                }
+            },
+        }
+
+        def fake_http(method, url, headers=None, json_body=None, timeout=30):
+            if url == "https://registry.npmjs.org/" + package_name:
+                return (200, json.dumps(npm_doc))
+            return (500, url)
+
+        engine = engine_mod.MCMEngine()
+        inspected = self._inspected_metadata(
+            engine_mod,
+            package_name,
+            tools,
+            180,
+            "2024-05-01T00:00:00Z",
+        )
+        try:
+            engine.save_metadata(inspected)
+        except Exception as exc:
+            self.fail("inspect save_metadata raised %r" % (exc,))
+        with patch.object(engine_mod, "http_request", side_effect=fake_http):
+            try:
+                discovered = engine.discover_from_npm(
+                    {"identifier": package_name, "type": "npm_package"}
+                )
+            except Exception as exc:
+                self.fail("discover_from_npm raised %r" % (exc,))
+        try:
+            engine.save_metadata(discovered)
+        except Exception as exc:
+            self.fail("discover save_metadata raised %r" % (exc,))
+        saved = self._read_json_object(
+            self.mcm_home / "registry" / package_name / "metadata.json"
+        )
+        self.assertEqual(saved["tools"], tools)
+        self.assertTrue(saved["inspected"])
+        self.assertEqual(saved["tool_count"], 1)
+        self.assertEqual(saved["description"], description)
+        self.assertEqual(saved["dependencies"], dependencies)
+        self.assertEqual(saved["inspected_at"], "2024-05-01T00:00:00Z")
+        self.assertEqual(saved["format"], "cli")
+        self.assertEqual(saved["context_cost_estimate"], 180)
+        self.assertEqual(saved["discovered_at"], discovered.discovered_at)
+        index = self._read_json_object(self.mcm_home / "registry" / "index.json")
+        matches = [
+            item for item in index["mcps"] if item.get("name") == package_name
+        ]
+        self.assertEqual(len(matches), 1)
+        entry = matches[0]
+        self.assertTrue(entry["inspected"])
+        self.assertEqual(entry["tool_count"], 1)
+        self.assertEqual(entry["context_tokens"], 180)
+
+    def test_discover_from_github_reads_default_branch_package_json(self):
+        """source: review: package.json was read from main before the repository default branch"""
+        engine_mod = load_engine(self.mcm_home)
+        recorded = []
+
+        def fake_http(method, url, headers=None, json_body=None, timeout=30):
+            recorded.append(url)
+            if "api.github.com" in url:
+                return (
+                    200,
+                    json.dumps(
+                        {
+                            "name": "repo",
+                            "html_url": "https://github.com/owner/repo",
+                            "description": "d",
+                            "default_branch": "trunk",
+                        }
+                    ),
+                )
+            return (404, "")
+
+        engine = engine_mod.MCMEngine()
+        with patch.object(engine_mod, "http_request", side_effect=fake_http):
+            engine.discover_from_github(
+                {"identifier": "owner/repo", "type": "github_url"}
+            )
+        pkg_urls = [url for url in recorded if url.endswith("/package.json")]
+        trunk = "https://raw.githubusercontent.com/owner/repo/trunk/package.json"
+        main = "https://raw.githubusercontent.com/owner/repo/main/package.json"
+        master = "https://raw.githubusercontent.com/owner/repo/master/package.json"
+        self.assertIn(trunk, pkg_urls)
+        self.assertLess(pkg_urls.index(trunk), pkg_urls.index(main))
+        self.assertLess(pkg_urls.index(trunk), pkg_urls.index(master))
+
+    def test_default_branch_is_quoted_in_the_raw_address(self):
+        """source: a default_branch with a space or hash was placed raw in the package.json address"""
+        engine_mod = load_engine(self.mcm_home)
+        recorded = []
+
+        def fake_http(method, url, headers=None, json_body=None, timeout=30):
+            recorded.append(url)
+            if "api.github.com" in url:
+                return (
+                    200,
+                    json.dumps(
+                        {
+                            "name": "repo",
+                            "html_url": "https://github.com/owner/repo",
+                            "description": "d",
+                            "default_branch": "release/1.0 #x",
+                        }
+                    ),
+                )
+            return (404, "")
+
+        engine = engine_mod.MCMEngine()
+        with patch.object(engine_mod, "http_request", side_effect=fake_http):
+            engine.discover_from_github(
+                {"identifier": "owner/repo", "type": "github_url"}
+            )
+        expected = (
+            "https://raw.githubusercontent.com/owner/repo/"
+            "release/1.0%20%23x/package.json"
+        )
+        self.assertIn(expected, recorded)
+
+    def test_github_null_description_is_saved_as_empty_string(self):
+        """source: review: a null GitHub description was saved as None"""
+        engine_mod = load_engine(self.mcm_home)
+
+        def fake_http(method, url, headers=None, json_body=None, timeout=30):
+            if "api.github.com" in url:
+                return (
+                    200,
+                    json.dumps(
+                        {
+                            "name": "repo",
+                            "html_url": "https://github.com/owner/repo",
+                            "description": None,
+                        }
+                    ),
+                )
+            return (404, "")
+
+        engine = engine_mod.MCMEngine()
+        with patch.object(engine_mod, "http_request", side_effect=fake_http):
+            metadata = engine.discover_from_github(
+                {"identifier": "owner/repo", "type": "github_url"}
+            )
+        self.assertIsInstance(metadata.description, str)
+        self.assertEqual(metadata.description, "")
+        engine.save_metadata(metadata)
+        saved = json.loads(
+            (self.mcm_home / "registry" / "repo" / "metadata.json").read_text()
+        )
+        self.assertEqual(saved["description"], "")
+
+    def test_registry_descriptions_drop_control_characters(self):
+        """source: review: GitHub and npm descriptions were saved with terminal control characters"""
+        engine_mod = load_engine(self.mcm_home)
+        hostile = "hello\u001b[31m\u009b"
+        npm_doc = {
+            "name": "demo-mcp",
+            "dist-tags": {"latest": "1.0.0"},
+            "versions": {
+                "1.0.0": {
+                    "description": hostile,
+                    "repository": {"url": "git+https://gitlab.com/example/demo-mcp.git"},
+                }
+            },
+        }
+
+        def fake_npm(method, url, headers=None, json_body=None, timeout=30):
+            return (200, json.dumps(npm_doc))
+
+        engine = engine_mod.MCMEngine()
+        with patch.object(engine_mod, "http_request", side_effect=fake_npm):
+            npm_meta = engine.discover_from_npm(
+                {"identifier": "demo-mcp", "type": "npm_package"}
+            )
+        self.assertEqual(npm_meta.description, "hello[31m")
+
+        def fake_github(method, url, headers=None, json_body=None, timeout=30):
+            if "api.github.com" in url:
+                return (
+                    200,
+                    json.dumps(
+                        {
+                            "name": "repo",
+                            "html_url": "https://github.com/owner/repo",
+                            "description": hostile,
+                        }
+                    ),
+                )
+            return (404, "")
+
+        with patch.object(engine_mod, "http_request", side_effect=fake_github):
+            github_meta = engine.discover_from_github(
+                {"identifier": "owner/repo", "type": "github_url"}
+            )
+        self.assertEqual(github_meta.description, "hello[31m")
+        for ch in github_meta.description + npm_meta.description:
+            self.assertGreaterEqual(ord(ch), 32)
+            self.assertFalse(0x80 <= ord(ch) <= 0x9F)
+
+    def test_descriptions_keep_a_space_for_newline_and_tab(self):
+        """source: a newline or tab in a description was deleted when control characters were stripped"""
+        engine_mod = load_engine(self.mcm_home)
+
+        def fake_http(method, url, headers=None, json_body=None, timeout=30):
+            if "api.github.com" in url:
+                return (
+                    200,
+                    json.dumps(
+                        {
+                            "name": "repo",
+                            "html_url": "https://github.com/owner/repo",
+                            "description": "first line\nsecond\tline",
+                        }
+                    ),
+                )
+            return (404, "")
+
+        engine = engine_mod.MCMEngine()
+        with patch.object(engine_mod, "http_request", side_effect=fake_http):
+            metadata = engine.discover_from_github(
+                {"identifier": "owner/repo", "type": "github_url"}
+            )
+        self.assertEqual(metadata.description, "first line second line")
+        engine.save_metadata(metadata)
+        saved = json.loads(
+            (self.mcm_home / "registry" / "repo" / "metadata.json").read_text()
+        )
+        self.assertEqual(saved["description"], "first line second line")
+        tools, _tokens = engine_mod.inspect_command(
+            [sys.executable, FAKE, "spacing"], timeout=10
+        )
+        self.assertEqual(tools[0]["description"], "first second")
+        self.assertIn(" ", tools[0]["description"])
+        self.assertNotIn("\n", tools[0]["description"])
+
+    def test_discover_from_github_wrong_package_json_shape(self):
+        """source: a package.json that was a JSON list, or whose dependencies was a string, raised during discovery"""
+        engine_mod = load_engine(self.mcm_home)
+
+        def discover(package_body):
+            def fake_http(method, url, headers=None, json_body=None, timeout=30):
+                if "api.github.com" in url:
+                    return (
+                        200,
+                        json.dumps(
+                            {
+                                "name": "repo",
+                                "html_url": "https://github.com/owner/repo",
+                                "description": "d",
+                            }
+                        ),
+                    )
+                if url.endswith("/package.json"):
+                    return (200, package_body)
+                return (404, "")
+
+            engine = engine_mod.MCMEngine()
+            buf = io.StringIO()
+            with patch.object(engine_mod, "http_request", side_effect=fake_http):
+                with contextlib.redirect_stdout(buf):
+                    try:
+                        return engine.discover_from_github(
+                            {"identifier": "owner/repo", "type": "github_url"}
+                        )
+                    except Exception as exc:
+                        self.fail("discover_from_github raised %r" % (exc,))
+
+        listed = discover("[1, 2, 3]")
+        self.assertIsNotNone(listed)
+        self.assertEqual(listed.name, "repo")
+        self.assertEqual(listed.dependencies, [])
+        text_deps = discover(json.dumps({"dependencies": "zod"}))
+        self.assertIsNotNone(text_deps)
+        self.assertEqual(text_deps.name, "repo")
+        self.assertEqual(text_deps.dependencies, [])
+
 
 class InputSafetyTests(IsolatedHomeTest):
     def test_invalid_entry_sends_nothing(self):
@@ -720,6 +1713,61 @@ class EngineMainTests(IsolatedHomeTest):
         self.assertEqual(ctx.exception.code, 1)
         self.assertIn("Discovered 0 of 1", buf.getvalue())
 
+    def test_discover_exit_codes_for_partial_and_empty_lists(self):
+        """source: discover exited 0 when some names failed, so the script said discovery was complete"""
+        engine_mod = load_engine(self.mcm_home)
+
+        def meta(name):
+            return engine_mod.MCPMetadata(
+                name=name,
+                source="npm",
+                url="http://example.test",
+                description="",
+                tools=[],
+                tool_count=0,
+                complexity_score=0.0,
+                context_cost_estimate=0,
+                dependencies=[],
+                credentials_needed=[],
+                discovered_at="2020-01-01T00:00:00Z",
+                format="direct",
+            )
+
+        def run(text, results):
+            list_file = self.tmp / "exit-codes.txt"
+            list_file.write_text(text)
+            with patch.object(
+                engine_mod.MCMEngine, "discover_mcp", side_effect=results
+            ), patch.object(engine_mod.time, "sleep"), patch.object(
+                engine_mod.sys,
+                "argv",
+                ["mcm_engine.py", "discover", str(list_file)],
+            ):
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    try:
+                        engine_mod.main()
+                        code = 0
+                    except SystemExit as exc:
+                        code = exc.code
+            return code, buf.getvalue()
+
+        code, out = run("alpha-mcp\nbeta-mcp\n", [meta("alpha-mcp"), meta("beta-mcp")])
+        self.assertEqual(code, 0)
+        self.assertIn("Discovered 2 of 2", out)
+
+        code, out = run("alpha-mcp\nbeta-mcp\n", [meta("alpha-mcp"), None])
+        self.assertEqual(code, 2)
+        self.assertIn("Discovered 1 of 2", out)
+
+        code, out = run("alpha-mcp\nbeta-mcp\n", [None, None])
+        self.assertEqual(code, 1)
+        self.assertIn("Discovered 0 of 2", out)
+
+        code, out = run("", [])
+        self.assertEqual(code, 0)
+        self.assertIn("Discovered 0 of 0", out)
+
     def test_discover_continues_when_save_refuses_a_name(self):
         """source: push review of 5034ea7: a refused registry name aborted the whole run"""
         engine_mod = load_engine(self.mcm_home)
@@ -771,7 +1819,7 @@ class EngineMainTests(IsolatedHomeTest):
                     code = exc.code
                 except (ValueError, OSError) as exc:
                     self.fail("a refused registry name escaped main: %r" % (exc,))
-        self.assertEqual(code, 0)
+        self.assertEqual(code, 2)
         out = buf.getvalue()
         self.assertIn("../escape: not saved", out)
         self.assertIn("Discovered 1 of 2", out)
@@ -805,6 +1853,97 @@ class EngineMainTests(IsolatedHomeTest):
         self.assertNotIn("DeprecationWarning", combined)
         self.assertNotIn("Traceback", combined)
         self.assertIn("Discovered 0 of 1", combined)
+
+    def test_engine_cli_usage_unknown_command_and_list(self):
+        """source: review: an unknown command printed nothing, a missing list file traced back, and list assumed keys"""
+        engine = str(SRC_DIR / "mcm_engine.py")
+        env = isolated_env(self.home)
+
+        def run(args):
+            return subprocess.run(
+                [sys.executable, engine] + args,
+                cwd=str(self.tmp),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+
+        for args in ([], ["--help"], ["-h"]):
+            proc = run(args)
+            combined = proc.stdout + proc.stderr
+            self.assertEqual(proc.returncode, 0, combined)
+            for word in ("discover", "inspect", "scan-config", "list"):
+                self.assertIn(word, combined)
+
+        bogus = run(["bogus"])
+        bogus_text = bogus.stdout + bogus.stderr
+        self.assertEqual(bogus.returncode, 1, bogus_text)
+        self.assertIn("unknown command bogus", bogus_text)
+        self.assertIn("discover", bogus_text)
+        self.assertNotIn("Traceback", bogus_text)
+
+        missing = self.tmp / "missing-mcp-list.txt"
+        discover = run(["discover", str(missing)])
+        discover_text = discover.stdout + discover.stderr
+        self.assertEqual(discover.returncode, 1, discover_text)
+        self.assertIn("cannot read", discover_text)
+        self.assertIn(str(missing), discover_text)
+        self.assertNotIn("Traceback", discover_text)
+
+        blocked = self.tmp / "unreadable-mcp-list.txt"
+        blocked.write_text("../not-a-package\n")
+        os.chmod(str(blocked), 0)
+        try:
+            if os.geteuid() != 0 and not os.access(str(blocked), os.R_OK):
+                denied = run(["discover", str(blocked)])
+                denied_text = denied.stdout + denied.stderr
+                self.assertEqual(denied.returncode, 1, denied_text)
+                self.assertIn("cannot read", denied_text)
+                self.assertNotIn("Traceback", denied_text)
+        finally:
+            os.chmod(str(blocked), 0o644)
+
+        empty = run(["list"])
+        empty_text = empty.stdout + empty.stderr
+        self.assertIn("No MCPs discovered yet.", empty_text)
+        self.assertNotIn("mcm discover", empty_text)
+        self.assertNotIn("Traceback", empty_text)
+
+        registry = self.mcm_home / "registry"
+        registry.mkdir(parents=True, exist_ok=True)
+        (registry / "index.json").write_text(
+            json.dumps({"mcps": [{"name": "partial"}]})
+        )
+        listed = run(["list"])
+        listed_text = listed.stdout + listed.stderr
+        self.assertEqual(listed.returncode, 0, listed_text)
+        self.assertIn("partial", listed_text)
+        self.assertNotIn("Traceback", listed_text)
+
+    def test_list_corrupt_index_is_reported_without_traceback(self):
+        """source: mcm list printed a traceback when the registry index was not valid JSON"""
+        registry = self.mcm_home / "registry"
+        registry.mkdir(parents=True)
+        index_path = registry / "index.json"
+        index_path.write_text("{not json")
+        env = isolated_env(self.home)
+        proc = subprocess.run(
+            [sys.executable, str(SRC_DIR / "mcm_engine.py"), "list"],
+            cwd=str(self.tmp),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        combined = proc.stdout + proc.stderr
+        expected = (
+            "The registry index is not valid JSON: %s. Move it aside and run discover again."
+            % index_path
+        )
+        self.assertEqual(proc.returncode, 1, combined)
+        self.assertIn(expected, combined)
+        self.assertNotIn("Traceback", combined)
 
 
 class ScanConfigTests(IsolatedHomeTest):
@@ -1033,6 +2172,204 @@ class DiscoverScriptTests(IsolatedHomeTest):
         leftovers = list(cache.glob("mcp-input-*.txt"))
         self.assertEqual(leftovers, [])
 
+    def test_discover_sh_reports_partial_failure_and_complete(self):
+        """source: discover.sh said discovery was complete when some names failed"""
+        scripts = install_copy(self.home)
+        stub_path = scripts / "mcm_engine.py"
+        env = isolated_env(self.home)
+        cache = Path(self.home) / ".mcm" / "cache"
+
+        stub_path.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            "sys.exit(2)\n"
+        )
+        partial = subprocess.run(
+            ["bash", str(scripts / "discover.sh"), "alpha"],
+            cwd=str(self.tmp),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        partial_text = partial.stdout + partial.stderr
+        self.assertEqual(partial.returncode, 2, partial_text)
+        self.assertIn("Discovery finished with failures", partial_text)
+        self.assertIn("Next steps:", partial_text)
+        self.assertIn("1. Review: cat ", partial_text)
+        self.assertIn("2. Validate: mcm validate", partial_text)
+        self.assertNotIn("Discovery complete", partial_text)
+        self.assertEqual(list(cache.glob("mcp-input-*.txt")), [])
+
+        stub_path.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            "sys.exit(0)\n"
+        )
+        done = subprocess.run(
+            ["bash", str(scripts / "discover.sh"), "alpha"],
+            cwd=str(self.tmp),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        done_text = done.stdout + done.stderr
+        self.assertEqual(done.returncode, 0, done_text)
+        self.assertIn("Discovery complete", done_text)
+        self.assertEqual(list(cache.glob("mcp-input-*.txt")), [])
+
+    def test_discover_sh_removes_temp_input_on_every_exit(self):
+        """source: review: discover.sh left its temporary input file behind on some exits"""
+        env = isolated_env(self.home)
+        discover = str(SRC_DIR / "commands" / "discover.sh")
+        cache = self.mcm_home / "cache"
+
+        def leftovers():
+            if not cache.exists():
+                return []
+            return list(cache.glob("mcp-input-*"))
+
+        failed = subprocess.run(
+            ["bash", discover, "../not-a-package"],
+            cwd=str(self.tmp),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        failed_text = failed.stdout + failed.stderr
+        self.assertEqual(failed.returncode, 1, failed_text)
+        self.assertIn("Discovery failed", failed_text)
+        self.assertNotIn("was not found", failed_text)
+        self.assertNotIn("No such file", failed_text)
+        self.assertEqual(leftovers(), [])
+
+        empty = subprocess.run(
+            ["bash", discover],
+            cwd=str(self.tmp),
+            env=env,
+            input="",
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        empty_text = empty.stdout + empty.stderr
+        self.assertEqual(empty.returncode, 1, empty_text)
+        self.assertIn("No MCP names given", empty_text)
+        self.assertEqual(leftovers(), [])
+
+        stub_dir = self.tmp / "stub-layout"
+        stub_dir.mkdir()
+        shutil.copy(
+            str(SRC_DIR / "commands" / "discover.sh"),
+            str(stub_dir / "discover.sh"),
+        )
+        (stub_dir / "mcm_engine.py").write_text(
+            "#!/usr/bin/env python3\nimport sys\nsys.exit(1)\n"
+        )
+        stub = subprocess.run(
+            ["bash", str(stub_dir / "discover.sh"), "alpha"],
+            cwd=str(self.tmp),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        stub_text = stub.stdout + stub.stderr
+        self.assertEqual(stub.returncode, 1, stub_text)
+        self.assertIn("Discovery failed", stub_text)
+        self.assertEqual(leftovers(), [])
+
+    def test_readme_scan_lines_match_discover(self):
+        """source: the README quotes the scan's files and its no-servers line; they must be what discover really reads and prints"""
+        try:
+            __import__("pty")
+        except ImportError:
+            self.skipTest("pty module cannot be imported")
+
+        text = (REPO_ROOT / "README.md").read_text()
+        self.assertIn("- `.mcp.json` in the folder you run it from", text)
+        self.assertIn(
+            "- `~/.claude.json`, both its own `mcpServers` and the `mcpServers` of each project listed in it",
+            text,
+        )
+        self.assertIn(
+            "it prints `No MCP servers found in ./.mcp.json or ~/.claude.json` and exits with code 1",
+            text,
+        )
+
+        scripts = install_copy(self.home)
+        discover = ["bash", str(scripts / "discover.sh")]
+
+        empty_dir = self.tmp / "scan-empty"
+        empty_dir.mkdir()
+        empty_code, empty_out = _run_with_pty_stdin(
+            discover,
+            empty_dir,
+            isolated_env(self.home),
+            "3\n",
+        )
+        self.assertEqual(empty_code, 1, empty_out)
+        self.assertIn(
+            "No MCP servers found in ./.mcp.json or ~/.claude.json",
+            empty_out,
+        )
+
+        both_dir = self.tmp / "scan-both"
+        both_dir.mkdir()
+        (both_dir / ".mcp.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "alpha": {
+                            "command": "npx",
+                            "args": ["-y", "@example/alpha-server@1.2.3"],
+                        },
+                        "local": {"command": "node", "args": ["server.js"]},
+                    }
+                }
+            )
+        )
+        (self.home / ".claude.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "beta": {"command": "bunx", "args": ["beta-server"]}
+                    },
+                    "projects": {
+                        "/somewhere": {
+                            "mcpServers": {
+                                "gamma": {
+                                    "command": "npx",
+                                    "args": ["gamma-server"],
+                                }
+                            }
+                        }
+                    },
+                }
+            )
+        )
+        both_code, both_out = _run_with_pty_stdin(
+            discover,
+            both_dir,
+            isolated_env(self.home),
+            "3\nn\n",
+        )
+        self.assertEqual(both_code, 0, both_out)
+        for piece in (
+            "These names will be looked up on npm or GitHub:",
+            "@example/alpha-server",
+            "beta-server",
+            "gamma-server",
+            "Skipped local: not started with npx or bunx",
+            "Found 3 MCPs. Proceed with discovery? (y/n)",
+            "Cancelled.",
+        ):
+            self.assertIn(piece, both_out)
+        self.assertNotIn("@1.2.3", both_out)
+        self.assertNotIn("Starting MCP discovery", both_out)
+
 
 class MainScriptTests(IsolatedHomeTest):
     def test_main_sh_search_is_unknown_and_help_omits_search(self):
@@ -1078,6 +2415,97 @@ class MainScriptTests(IsolatedHomeTest):
         combined = proc.stdout + proc.stderr
         self.assertNotIn("\\033", combined)
         self.assertIn("Commands:", combined)
+
+    def test_main_through_symlink_runs_help_and_status(self):
+        """source: review: a symlink to main.sh left SCRIPT_DIR unresolved, so commands could not find sibling scripts"""
+        scripts = install_copy(self.home)
+        link_dir = self.tmp / "elsewhere"
+        link_dir.mkdir()
+        link = link_dir / "mcm"
+        os.symlink(os.path.relpath(str(scripts / "main.sh"), str(link_dir)), str(link))
+        env = isolated_env(self.home)
+        help_proc = subprocess.run(
+            [str(link), "help"],
+            cwd=str(self.tmp),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        self.assertEqual(
+            help_proc.returncode,
+            0,
+            help_proc.stdout + help_proc.stderr,
+        )
+
+        registry = self.mcm_home / "registry"
+        registry.mkdir(parents=True, exist_ok=True)
+        (registry / "index.json").write_text(json.dumps({"mcps": []}))
+        status_proc = subprocess.run(
+            [str(link), "status"],
+            cwd=str(self.tmp),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        self.assertEqual(
+            status_proc.returncode,
+            0,
+            status_proc.stdout + status_proc.stderr,
+        )
+
+    def test_main_sh_from_repo_reaches_the_engine(self):
+        """source: review: scripts found the engine only in the installed flat layout"""
+        env = isolated_env(self.home)
+        proc = subprocess.run(
+            ["bash", "src/commands/main.sh", "inspect", "../evil", "--yes"],
+            cwd=str(REPO_ROOT),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        combined = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 1, combined)
+        self.assertIn("not an npm package name", combined)
+        self.assertNotIn("No such file", combined)
+
+    def test_main_sh_missing_engine_reports_the_search(self):
+        """source: review: scripts found the engine only in the installed flat layout"""
+        lone = self.tmp / "no-engine" / "commands"
+        lone.mkdir(parents=True)
+        shutil.copy(str(SRC_DIR / "commands" / "main.sh"), str(lone / "main.sh"))
+        env = isolated_env(self.home)
+        proc = subprocess.run(
+            ["bash", str(lone / "main.sh"), "inspect", "demo", "--yes"],
+            cwd=str(self.tmp),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        combined = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 1, combined)
+        self.assertIn("was not found", combined)
+        self.assertIn("one folder up", combined)
+
+    def test_main_sh_maps_help_flags(self):
+        """source: review: main.sh did not map -h and --help to help"""
+        main = SRC_DIR / "commands" / "main.sh"
+        env = isolated_env(self.home)
+        for flag in ("-h", "--help"):
+            proc = subprocess.run(
+                ["bash", str(main), flag],
+                cwd=str(self.tmp),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            combined = proc.stdout + proc.stderr
+            self.assertEqual(proc.returncode, 0, combined)
+            self.assertIn("Commands:", combined)
 
 
 class ImportTests(unittest.TestCase):
@@ -1260,13 +2688,65 @@ class InspectTests(IsolatedHomeTest):
                     pass
 
     def test_inspect_malformed_line(self):
-        """source: rail: a stdout line that is not JSON-RPC raises InspectError"""
+        """source: a non-JSON stdout line aborted inspect instead of being skipped and counted"""
         engine_mod = load_engine(self.mcm_home)
+        notes = []
+        tools, _tokens = engine_mod.inspect_command(
+            [sys.executable, FAKE, "malformed"], timeout=10, notes=notes
+        )
+        self.assertEqual(len(tools), 2)
+        self.assertEqual(
+            notes,
+            [
+                "the server wrote 1 line(s) to its output that are not JSON-RPC; they were ignored"
+            ],
+        )
+
+    def test_inspect_nonjson_timeout_names_the_count(self):
+        """source: a server that writes only non-JSON lines and never answers timed out without saying those lines were ignored"""
+        engine_mod = load_engine(self.mcm_home)
+        started = time.monotonic()
         with self.assertRaises(engine_mod.InspectError) as ctx:
             engine_mod.inspect_command(
-                [sys.executable, FAKE, "malformed"], timeout=10
+                [sys.executable, FAKE, "nonjson"],
+                timeout=2,
             )
-        self.assertIn("not JSON-RPC", str(ctx.exception))
+        elapsed = time.monotonic() - started
+        message = str(ctx.exception)
+        self.assertLess(elapsed, 6)
+        self.assertIn("did not answer within 2 seconds", message)
+        self.assertTrue(
+            message.endswith(
+                " (1 line(s) of its output were not JSON-RPC). If npx was still downloading the package, run it again."
+            ),
+            message,
+        )
+
+    def test_inspect_cli_prints_nonjson_note(self):
+        """source: mcm inspect did not say how many non-JSON-RPC lines it ignored"""
+        proc, _record = self._run_inspect(
+            ["inspect", "fake-pkg", "--yes", "--", "malformed"]
+        )
+        combined = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 0, combined)
+        note = (
+            "Note: the server wrote 1 line(s) to its output that are not JSON-RPC; they were ignored"
+        )
+        self.assertIn(note, proc.stdout)
+        self.assertGreater(proc.stdout.find(note), proc.stdout.find("schema"))
+
+    def test_inspect_corrupt_index_reports_save_failure(self):
+        """source: mcm inspect printed a traceback when the registry index could not be saved"""
+        registry = self.mcm_home / "registry"
+        registry.mkdir(parents=True)
+        (registry / "index.json").write_text("{not json")
+        proc, _record = self._run_inspect(
+            ["inspect", "fake-pkg", "--yes", "--", "ok"]
+        )
+        combined = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 1, combined)
+        self.assertIn("was inspected but not saved", combined)
+        self.assertNotIn("Traceback", combined)
 
     def test_inspect_tools_list_error(self):
         """source: rail: a tools/list error is reported with the server's message"""
@@ -1283,6 +2763,60 @@ class InspectTests(IsolatedHomeTest):
         message = str(ctx.exception)
         self.assertIn("exit code 3", message)
         self.assertIn("boom", message)
+
+    def test_inspect_strips_hostile_stderr(self):
+        """source: review: a failed inspect printed the server stderr unsanitized"""
+        engine_mod = load_engine(self.mcm_home)
+        with self.assertRaises(engine_mod.InspectError) as ctx:
+            engine_mod.inspect_command(
+                [sys.executable, FAKE, "stderr_controls"], timeout=10
+            )
+        message = str(ctx.exception)
+        self.assertIn("red", message)
+        self.assertIn("red |", message)
+        for ch in message:
+            code = ord(ch)
+            self.assertGreaterEqual(code, 32)
+            self.assertNotEqual(ch, "\u001b")
+            self.assertFalse(0x80 <= code <= 0x9F)
+
+    def test_inspect_ignores_an_answer_with_another_id(self):
+        """source: an answer with another id was accepted as the tools list"""
+        engine_mod = load_engine(self.mcm_home)
+        try:
+            ok_tools, _ok_tokens = engine_mod.inspect_command(
+                [sys.executable, FAKE, "ok"], timeout=10
+            )
+        except Exception as exc:
+            self.fail("ok mode inspect raised: %s" % exc)
+        try:
+            tools, _tokens = engine_mod.inspect_command(
+                [sys.executable, FAKE, "stale_id"], timeout=10
+            )
+        except Exception as exc:
+            self.fail("an answer with another id aborted inspect: %s" % exc)
+        names = [tool["name"] for tool in tools]
+        ok_names = [tool["name"] for tool in ok_tools]
+        self.assertEqual(names, ok_names)
+        self.assertNotIn("wrong_tool", names)
+
+    def test_inspect_skips_request_with_the_awaited_id(self):
+        """source: review: a server-sent request whose id equals the awaited id was taken as the answer"""
+        engine_mod = load_engine(self.mcm_home)
+        try:
+            ok_tools, _ok_tokens = engine_mod.inspect_command(
+                [sys.executable, FAKE, "ok"], timeout=10
+            )
+        except Exception as exc:
+            self.fail("ok mode inspect raised: %s" % exc)
+        try:
+            tools, _tokens = engine_mod.inspect_command(
+                [sys.executable, FAKE, "same_id"], timeout=10
+            )
+        except engine_mod.InspectError as exc:
+            self.fail("a server request was taken as the answer: %s" % exc)
+        self.assertEqual(len(tools), len(ok_tools))
+        self.assertEqual(tools[0]["name"], "read_file")
 
     def test_inspect_env_is_minimal_and_folder_removed(self):
         """source: rail: the server receives only PATH, HOME, USER, LANG and TMPDIR, and its folder is removed"""
@@ -1539,7 +3073,7 @@ class InspectTests(IsolatedHomeTest):
         popen.assert_not_called()
 
     def test_save_metadata_keeps_inspected_entry(self):
-        """source: rail: saving a package again without inspection keeps the inspected tool count"""
+        """source: a discover after an inspect dropped the description, and a later save could drop the inspected tool count"""
         engine_mod = load_engine(self.mcm_home)
         engine = engine_mod.MCMEngine()
         inspected = engine_mod.MCPMetadata(
@@ -1575,15 +3109,1061 @@ class InspectTests(IsolatedHomeTest):
             discovered_at="2021-01-01T00:00:00Z",
             format="direct",
         )
-        engine.save_metadata(inspected)
+        try:
+            engine.save_metadata(inspected)
+            engine.save_metadata(plain)
+        except Exception as exc:
+            self.fail("save_metadata raised %r" % (exc,))
         meta_path = self.mcm_home / "registry" / "demo-mcp" / "metadata.json"
-        before = meta_path.read_text()
-        engine.save_metadata(plain)
-        self.assertEqual(meta_path.read_text(), before)
-        index = json.loads((self.mcm_home / "registry" / "index.json").read_text())
-        entry = [item for item in index["mcps"] if item["name"] == "demo-mcp"][0]
+        try:
+            saved = json.loads(meta_path.read_text())
+        except Exception as exc:
+            self.fail("saved metadata is not valid JSON: %r" % (exc,))
+        self.assertEqual(saved["description"], "later")
+        self.assertEqual(
+            saved["tools"],
+            [
+                {"name": "a", "description": "", "schema_size": 1},
+                {"name": "b", "description": "", "schema_size": 2},
+            ],
+        )
+        self.assertEqual(saved["tool_count"], 2)
+        self.assertEqual(saved["complexity_score"], 2.0)
+        self.assertEqual(saved["context_cost_estimate"], 10)
+        self.assertEqual(saved["format"], "cli")
+        self.assertTrue(saved["inspected"])
+        self.assertEqual(saved["inspected_at"], "2020-01-01T00:00:00Z")
+        self.assertEqual(saved["discovered_at"], "2021-01-01T00:00:00Z")
+        try:
+            index = json.loads(
+                (self.mcm_home / "registry" / "index.json").read_text()
+            )
+        except Exception as exc:
+            self.fail("registry index is not valid JSON: %r" % (exc,))
+        matches = [
+            item for item in index["mcps"] if item.get("name") == "demo-mcp"
+        ]
+        self.assertEqual(len(matches), 1)
+        entry = matches[0]
         self.assertTrue(entry["inspected"])
         self.assertEqual(entry["tool_count"], 2)
+        self.assertEqual(entry["context_tokens"], 10)
+
+    def test_inspect_passes_proxy_and_certificate_settings(self):
+        """source: inspect passed no proxy or certificate settings to npx, so a download behind a proxy failed"""
+        engine_mod = load_engine(self.mcm_home)
+        report = self.tmp / "env-report.json"
+        names = ("HTTPS_PROXY", "NODE_EXTRA_CA_CERTS", "SECRET_TOKEN")
+        saved = {}
+        for key in names:
+            saved[key] = os.environ.get(key)
+        os.environ["HTTPS_PROXY"] = "http://proxy.example:8080"
+        os.environ["NODE_EXTRA_CA_CERTS"] = "/tmp/ca.pem"
+        os.environ["SECRET_TOKEN"] = "secret-value"
+        try:
+            try:
+                engine_mod.inspect_command(
+                    [sys.executable, FAKE, "env", str(report)], timeout=10
+                )
+            except Exception as exc:
+                self.fail("env mode inspect raised: %s" % exc)
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+        try:
+            info = json.loads(report.read_text())
+        except Exception as exc:
+            self.fail("env report is not valid JSON: %r" % (exc,))
+        seen = info["keys"]
+        self.assertIn("HTTPS_PROXY", seen)
+        self.assertIn("NODE_EXTRA_CA_CERTS", seen)
+        self.assertNotIn("SECRET_TOKEN", seen)
+
+    def test_inspect_withholds_proxy_userinfo(self):
+        """source: a proxy address with a user name or password was passed to the untrusted server"""
+        engine_mod = load_engine(self.mcm_home)
+        note = (
+            "a proxy setting that holds a user name or password was not passed to the server"
+        )
+        keys = (
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        )
+        saved = {}
+        for key in keys:
+            saved[key] = os.environ.get(key)
+
+        def restore():
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+        def clear_proxies():
+            for key in keys:
+                os.environ.pop(key, None)
+
+        def run_env():
+            report = self.tmp / "env-report.json"
+            if report.exists():
+                report.unlink()
+            notes = []
+            try:
+                engine_mod.inspect_command(
+                    [sys.executable, FAKE, "env", str(report)],
+                    timeout=10,
+                    notes=notes,
+                )
+            except Exception as exc:
+                self.fail("env mode inspect raised: %s" % exc)
+            try:
+                info = json.loads(report.read_text())
+            except Exception as exc:
+                self.fail("env report is not valid JSON: %r" % (exc,))
+            return info, notes
+
+        try:
+            clear_proxies()
+            user = "user"
+            password = "pass"
+            host = "proxy.example.test:8080"
+            os.environ["HTTPS_PROXY"] = "http://%s:%s@%s" % (user, password, host)
+            try:
+                env, withheld = engine_mod._inspect_env()
+            except Exception as exc:
+                self.fail("_inspect_env raised %r" % (exc,))
+            self.assertNotIn("HTTPS_PROXY", env)
+            self.assertIn("HTTPS_PROXY", withheld)
+            info, notes = run_env()
+            self.assertNotIn("HTTPS_PROXY", info["keys"])
+            self.assertIn(note, notes)
+
+            clear_proxies()
+            os.environ["HTTPS_PROXY"] = "http://proxy.example.test:8080"
+            try:
+                env, withheld = engine_mod._inspect_env()
+            except Exception as exc:
+                self.fail("_inspect_env raised %r" % (exc,))
+            self.assertEqual(env.get("HTTPS_PROXY"), "http://proxy.example.test:8080")
+            self.assertNotIn("HTTPS_PROXY", withheld)
+            info, notes = run_env()
+            self.assertIn("HTTPS_PROXY", info["keys"])
+            self.assertNotIn(note, notes)
+
+            clear_proxies()
+            os.environ["http_proxy"] = "user:pw@proxy.example.test:8080"
+            try:
+                env, withheld = engine_mod._inspect_env()
+            except Exception as exc:
+                self.fail("_inspect_env raised %r" % (exc,))
+            self.assertNotIn("http_proxy", env)
+            self.assertIn("http_proxy", withheld)
+            info, notes = run_env()
+            self.assertNotIn("http_proxy", info["keys"])
+            self.assertIn(note, notes)
+        finally:
+            restore()
+
+    def test_inspect_cli_prints_withheld_proxy_note(self):
+        """source: mcm inspect did not say when a proxy setting with a user name or password was withheld"""
+        saved = os.environ.get("HTTPS_PROXY")
+        user = "user"
+        password = "pw"
+        os.environ["HTTPS_PROXY"] = "http://%s:%s@proxy.example.test:8080" % (
+            user,
+            password,
+        )
+        try:
+            proc, _record = self._run_inspect(
+                ["inspect", "fake-pkg", "--yes", "--", "ok"]
+            )
+        finally:
+            if saved is None:
+                os.environ.pop("HTTPS_PROXY", None)
+            else:
+                os.environ["HTTPS_PROXY"] = saved
+        combined = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 0, combined)
+        self.assertIn(
+            "Note: a proxy setting that holds a user name or password was not passed to the server",
+            proc.stdout,
+        )
+
+    def test_proxy_value_withheld_when_value_contains_at(self):
+        """source: a proxy address with credentials was parsed as a scheme and passed to the server"""
+        engine_mod = load_engine(self.mcm_home)
+        user = "user"
+        password = "pw"
+        host = "proxy.example.test:8080"
+        with_scheme = "http://%s:%s@%s" % (user, password, host)
+        without_scheme = "%s:%s@%s" % (user, password, host)
+        bypass = "%s:%s@host:8080/?r=http://x" % (user, password)
+        self.assertTrue(engine_mod._proxy_value_withheld(with_scheme))
+        self.assertTrue(engine_mod._proxy_value_withheld(without_scheme))
+        self.assertTrue(engine_mod._proxy_value_withheld(bypass))
+        self.assertFalse(
+            engine_mod._proxy_value_withheld("http://proxy.example.test:8080")
+        )
+        self.assertFalse(
+            engine_mod._proxy_value_withheld("proxy.example.test:8080")
+        )
+        self.assertFalse(
+            engine_mod._proxy_value_withheld("socks5://proxy.example.test:1080")
+        )
+
+    def test_inspect_env_withholds_proxy_bypass_value(self):
+        """source: a proxy address with credentials after a question mark was passed to the server"""
+        engine_mod = load_engine(self.mcm_home)
+        note = (
+            "a proxy setting that holds a user name or password was not passed to the server"
+        )
+        keys = (
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        )
+        saved = {}
+        for key in keys:
+            saved[key] = os.environ.get(key)
+        user = "user"
+        password = "pw"
+        bypass = "%s:%s@host:8080/?r=http://x" % (user, password)
+        report = self.tmp / "env-bypass.json"
+        notes = []
+        try:
+            for key in keys:
+                os.environ.pop(key, None)
+            os.environ["HTTPS_PROXY"] = bypass
+            if report.exists():
+                report.unlink()
+            try:
+                engine_mod.inspect_command(
+                    [sys.executable, FAKE, "env", str(report)],
+                    timeout=10,
+                    notes=notes,
+                )
+            except Exception as exc:
+                self.fail("env mode inspect raised: %s" % exc)
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+        try:
+            info = json.loads(report.read_text())
+        except Exception as exc:
+            self.fail("env report is not valid JSON: %r" % (exc,))
+        self.assertNotIn("HTTPS_PROXY", info["keys"])
+        self.assertIn(note, notes)
+
+    def test_inspect_timeout_says_to_run_again(self):
+        """source: a timeout during the first download gave no hint to run it again"""
+        engine_mod = load_engine(self.mcm_home)
+        started = time.monotonic()
+        with self.assertRaises(engine_mod.InspectError) as ctx:
+            engine_mod.inspect_command(
+                [sys.executable, "-c", "import sys; sys.stdin.read()"],
+                timeout=1,
+            )
+        self.assertLess(time.monotonic() - started, 6)
+        message = str(ctx.exception)
+        self.assertTrue(
+            message.endswith(
+                " If npx was still downloading the package, run it again."
+            ),
+            message,
+        )
+
+    def test_inspect_notes_when_tools_exceed_twenty_pages(self):
+        """source: a server with more than 20 pages of tools was read without saying pages were left"""
+        engine_mod = load_engine(self.mcm_home)
+        notes = []
+        try:
+            tools, _tokens = engine_mod.inspect_command(
+                [sys.executable, FAKE, "endless"], timeout=10, notes=notes
+            )
+        except Exception as exc:
+            self.fail("extra tool pages aborted inspect: %s" % exc)
+        self.assertEqual(len(tools), 20)
+        self.assertIn(
+            "the server has more than 20 pages of tools; only the first 20 pages were read",
+            notes,
+        )
+
+    def test_inspect_skips_deeply_nested_json(self):
+        """source: a deeply nested JSON line raised RecursionError and aborted inspect"""
+        engine_mod = load_engine(self.mcm_home)
+        notes = []
+        try:
+            tools, _tokens = engine_mod.inspect_command(
+                [sys.executable, FAKE, "deep"], timeout=10, notes=notes
+            )
+        except Exception as exc:
+            self.fail("a deeply nested line aborted inspect: %s" % exc)
+        names = [tool["name"] for tool in tools]
+        self.assertEqual(names, ["read_file", "bare"])
+        self.assertEqual(
+            notes,
+            [
+                "the server wrote 1 line(s) to its output that are not JSON-RPC; they were ignored"
+            ],
+        )
+
+    def test_inspect_ignores_boolean_id(self):
+        """source: an answer whose id was true was taken as the answer to request 1"""
+        engine_mod = load_engine(self.mcm_home)
+        try:
+            ok_tools, _ok_tokens = engine_mod.inspect_command(
+                [sys.executable, FAKE, "ok"], timeout=10
+            )
+        except Exception as exc:
+            self.fail("ok mode inspect raised: %s" % exc)
+        try:
+            tools, _tokens = engine_mod.inspect_command(
+                [sys.executable, FAKE, "bool_id"], timeout=10
+            )
+        except Exception as exc:
+            self.fail(
+                "an answer whose id is true was taken as the answer: %s" % exc
+            )
+        self.assertEqual(
+            [tool["name"] for tool in tools],
+            [tool["name"] for tool in ok_tools],
+        )
+
+    def test_clean_tools_drops_empty_names_and_limits_length(self):
+        """source: a tool name of only controls, longer than 200 characters, or holding bidi overrides was saved"""
+        engine_mod = load_engine(self.mcm_home)
+        raw = [
+            {"name": "\u0001\u001b", "description": "x"},
+            {"name": "a" * 500, "description": ""},
+            {"name": "ab\u202ecd\u200bef", "description": ""},
+        ]
+        try:
+            tools = engine_mod._clean_tools(raw)
+        except Exception as exc:
+            self.fail("_clean_tools raised %r" % (exc,))
+        names = [tool["name"] for tool in tools]
+        self.assertEqual(len(names), 2)
+        self.assertEqual(names[0], "a" * 200)
+        self.assertEqual(len(names[0]), 200)
+        self.assertEqual(names[1], "abcdef")
+        self.assertNotIn("\u202e", names[1])
+        self.assertNotIn("\u200b", names[1])
+
+    def test_read_stderr_tail_reads_only_the_end(self):
+        """source: a large stderr file was read in full"""
+        engine_mod = load_engine(self.mcm_home)
+        path = self.tmp / "stderr.txt"
+        body = b"S" + (b"m" * (1024 * 1024)) + b"E"
+        path.write_bytes(body)
+        try:
+            text = engine_mod._read_stderr_tail(str(path))
+        except Exception as exc:
+            self.fail("_read_stderr_tail raised %r" % (exc,))
+        encoded = text.encode("utf-8")
+        self.assertLessEqual(len(encoded), 4096)
+        self.assertEqual(encoded, body[-4096:])
+        self.assertTrue(body.endswith(encoded))
+        self.assertNotIn("S", text)
+
+    def test_inspect_start_failures_do_not_traceback(self):
+        """source: an OSError starting npx, or end of input at Continue, printed a traceback"""
+        engine_mod = load_engine(self.mcm_home)
+        engine = engine_mod.MCMEngine()
+
+        class _TtyStdin(io.StringIO):
+            def isatty(self):
+                return True
+
+        out = io.StringIO()
+        err = io.StringIO()
+        escaped = None
+        code = None
+        with patch.object(
+            engine_mod.sys, "argv", ["mcm_engine.py", "inspect", "demo-pkg", "--yes"]
+        ), patch.object(
+            engine_mod.shutil, "which", return_value="/usr/bin/npx"
+        ), patch.object(
+            engine_mod.subprocess, "Popen", side_effect=OSError("boom")
+        ), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                engine_mod._cmd_inspect(engine)
+            except SystemExit as exc:
+                code = exc.code
+            except Exception as exc:
+                escaped = exc
+        self.assertIsNone(escaped, "raised %r" % (escaped,))
+        self.assertEqual(code, 1)
+        combined = out.getvalue() + err.getvalue()
+        self.assertIn("Error: inspect could not run (boom)", combined)
+        self.assertNotIn("Traceback", combined)
+
+        out = io.StringIO()
+        err = io.StringIO()
+        escaped = None
+        code = None
+        tty = _TtyStdin("")
+        with patch.object(
+            engine_mod.sys, "argv", ["mcm_engine.py", "inspect", "demo-pkg"]
+        ), patch.object(
+            engine_mod.shutil, "which", return_value="/usr/bin/npx"
+        ), patch.object(
+            engine_mod.sys, "stdin", tty
+        ), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                engine_mod._cmd_inspect(engine)
+            except SystemExit as exc:
+                code = exc.code
+            except Exception as exc:
+                escaped = exc
+        self.assertIsNone(escaped, "raised %r" % (escaped,))
+        self.assertEqual(code, 1)
+        combined = out.getvalue() + err.getvalue()
+        self.assertIn("Not started.", combined)
+        self.assertNotIn("Traceback", combined)
+
+    def test_inspect_oserror_says_could_not_run(self):
+        """source: an OSError outside the exchange was reported as could not start npx"""
+        engine_mod = load_engine(self.mcm_home)
+        engine = engine_mod.MCMEngine()
+        saved_proxy = os.environ.get("HTTPS_PROXY")
+        user = "user"
+        password = "pw"
+        os.environ["HTTPS_PROXY"] = "http://%s:%s@proxy.example.test:8080" % (
+            user,
+            password,
+        )
+        out = io.StringIO()
+        err = io.StringIO()
+        escaped = None
+        code = None
+        try:
+            with patch.object(
+                engine_mod.sys,
+                "argv",
+                ["mcm_engine.py", "inspect", "demo-pkg", "--yes"],
+            ), patch.object(
+                engine_mod.shutil, "which", return_value="/usr/bin/npx"
+            ), patch.object(
+                engine_mod.subprocess, "Popen", side_effect=OSError("boom")
+            ), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                try:
+                    engine_mod._cmd_inspect(engine)
+                except SystemExit as exc:
+                    code = exc.code
+                except Exception as exc:
+                    escaped = exc
+        finally:
+            if saved_proxy is None:
+                os.environ.pop("HTTPS_PROXY", None)
+            else:
+                os.environ["HTTPS_PROXY"] = saved_proxy
+        self.assertIsNone(escaped, "raised %r" % (escaped,))
+        self.assertEqual(code, 1)
+        combined = out.getvalue() + err.getvalue()
+        self.assertIn("Error: inspect could not run (", combined)
+        note = (
+            "Note: a proxy setting that holds a user name or password was not passed to the server"
+        )
+        self.assertIn(note, combined)
+        self.assertLess(combined.find(note), combined.find("Error: inspect could not run ("))
+        self.assertNotIn("Traceback", combined)
+
+
+class RegistryIndexTests(IsolatedHomeTest):
+    def _metadata(self, engine_mod, name="demo-mcp"):
+        return engine_mod.MCPMetadata(
+            name=name,
+            source="npm",
+            url="https://www.npmjs.com/package/" + name,
+            description="",
+            tools=[],
+            tool_count=0,
+            complexity_score=0.0,
+            context_cost_estimate=0,
+            dependencies=[],
+            credentials_needed=[],
+            discovered_at="2020-01-01T00:00:00Z",
+            format="direct",
+        )
+
+    def test_corrupt_index_is_reported_without_traceback(self):
+        """source: review: a corrupt registry index raised a traceback in status and validate"""
+        engine_mod = load_engine(self.mcm_home)
+        engine = engine_mod.MCMEngine()
+        index_path = self.mcm_home / "registry" / "index.json"
+        index_path.write_text("{not json")
+        with self.assertRaises(ValueError) as ctx:
+            engine.save_metadata(self._metadata(engine_mod))
+        self.assertEqual(
+            str(ctx.exception),
+            "The registry index is not valid JSON: %s. Move it aside and run discover again."
+            % index_path,
+        )
+
+        env = isolated_env(self.home)
+        expected = (
+            "The registry index is not valid JSON: %s. Move it aside and run discover again."
+            % index_path
+        )
+        for script in ("status.sh", "validate.sh"):
+            proc = subprocess.run(
+                ["bash", str(SRC_DIR / "commands" / script)],
+                cwd=str(self.tmp),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            combined = proc.stdout + proc.stderr
+            self.assertEqual(proc.returncode, 1, combined)
+            self.assertIn(expected, combined)
+            self.assertIn("is not valid JSON", combined)
+            self.assertNotIn("Traceback", combined)
+
+    def test_index_without_mcps_is_accepted(self):
+        """source: review: an index without mcps was not accepted"""
+        engine_mod = load_engine(self.mcm_home)
+        engine = engine_mod.MCMEngine()
+        index_path = self.mcm_home / "registry" / "index.json"
+        index_path.parent.mkdir(parents=True, exist_ok=True)
+        index_path.write_text("{}")
+        engine.save_metadata(self._metadata(engine_mod))
+        saved = json.loads(index_path.read_text())
+        self.assertEqual([item["name"] for item in saved["mcps"]], ["demo-mcp"])
+
+    def test_save_metadata_leaves_no_temp_file(self):
+        """source: review: the registry index was rewritten in place"""
+        engine_mod = load_engine(self.mcm_home)
+        engine = engine_mod.MCMEngine()
+        engine.save_metadata(self._metadata(engine_mod))
+        registry = self.mcm_home / "registry"
+        files = sorted(
+            path.relative_to(registry).as_posix()
+            for path in registry.rglob("*")
+            if path.is_file()
+        )
+        self.assertEqual(files, ["demo-mcp/metadata.json", "index.json"])
+        parsed = json.loads((registry / "index.json").read_text())
+        self.assertEqual(parsed["mcps"][0]["name"], "demo-mcp")
+
+    def test_failed_index_write_keeps_the_old_index_and_no_temp_file(self):
+        """source: a failed registry index write replaced the old index or left a temp file"""
+        engine_mod = load_engine(self.mcm_home)
+        engine = engine_mod.MCMEngine()
+        engine.save_metadata(self._metadata(engine_mod, "kept-mcp"))
+        index_path = self.mcm_home / "registry" / "index.json"
+        recorded = index_path.read_bytes()
+        real_dump = engine_mod.json.dump
+
+        def failing_dump(payload, handle, *args, **kwargs):
+            if isinstance(payload, dict) and "mcps" in payload:
+                handle.write("{")
+                raise OSError("disk full")
+            return real_dump(payload, handle, *args, **kwargs)
+
+        with patch.object(engine_mod.json, "dump", failing_dump):
+            with self.assertRaises(OSError):
+                engine.save_metadata(self._metadata(engine_mod, "other-mcp"))
+        self.assertEqual(index_path.read_bytes(), recorded)
+        registry = self.mcm_home / "registry"
+        leftover = []
+        for dirpath, _dirnames, filenames in os.walk(str(registry)):
+            for name in filenames:
+                if name.startswith(".mcm-tmp-"):
+                    leftover.append(os.path.join(dirpath, name))
+        self.assertEqual(leftover, [])
+
+    def test_save_metadata_replaces_metadata_that_is_not_json(self):
+        """source: a saved metadata.json holding the text not json, or not an object, aborted the next save"""
+        engine_mod = load_engine(self.mcm_home)
+        engine = engine_mod.MCMEngine()
+        meta_path = self.mcm_home / "registry" / "demo-mcp" / "metadata.json"
+        meta_path.parent.mkdir(parents=True, exist_ok=True)
+        meta_path.write_text("not json")
+        try:
+            engine.save_metadata(self._metadata(engine_mod))
+        except Exception as exc:
+            self.fail("save_metadata raised %r" % (exc,))
+        try:
+            saved = json.loads(meta_path.read_text())
+        except Exception as exc:
+            self.fail("saved metadata is not valid JSON: %r" % (exc,))
+        self.assertIsInstance(saved, dict)
+        self.assertEqual(saved["name"], "demo-mcp")
+        self.assertEqual(saved["source"], "npm")
+
+        array_path = self.mcm_home / "registry" / "other-mcp" / "metadata.json"
+        array_path.parent.mkdir(parents=True, exist_ok=True)
+        array_path.write_text("[]")
+        try:
+            engine.save_metadata(self._metadata(engine_mod, "other-mcp"))
+        except Exception as exc:
+            self.fail("save_metadata raised %r for a JSON array" % (exc,))
+        try:
+            array_saved = json.loads(array_path.read_text())
+        except Exception as exc:
+            self.fail("saved metadata is not valid JSON: %r" % (exc,))
+        self.assertIsInstance(array_saved, dict)
+        self.assertEqual(array_saved["name"], "other-mcp")
+
+    def test_save_metadata_keeps_string_and_nameless_entries(self):
+        """source: an index entry that was a string or had no name raised while saving"""
+        engine_mod = load_engine(self.mcm_home)
+        engine = engine_mod.MCMEngine()
+        index_path = self.mcm_home / "registry" / "index.json"
+        index_path.parent.mkdir(parents=True, exist_ok=True)
+        index_path.write_text(
+            json.dumps({"mcps": ["keep-me", {"source": "npm"}]})
+        )
+        try:
+            engine.save_metadata(self._metadata(engine_mod))
+        except Exception as exc:
+            self.fail("save_metadata raised %r" % (exc,))
+        try:
+            saved = json.loads(index_path.read_text())
+        except Exception as exc:
+            self.fail("registry index is not valid JSON: %r" % (exc,))
+        mcps = saved["mcps"]
+        self.assertEqual(mcps[0], "keep-me")
+        self.assertEqual(mcps[1], {"source": "npm"})
+        self.assertEqual(mcps[2]["name"], "demo-mcp")
+
+    def test_wrong_shaped_index_is_reported_and_null_counts_are_zero(self):
+        """source: an index that was a JSON list, or an entry whose tool_count was null, traced back in list, status, and validate"""
+        registry = self.mcm_home / "registry"
+        registry.mkdir(parents=True)
+        index_path = registry / "index.json"
+        env = isolated_env(self.home)
+        engine = str(SRC_DIR / "mcm_engine.py")
+        expected = (
+            "The registry index is not in the expected shape: %s. Move it aside and run discover again."
+            % index_path
+        )
+
+        def run_list():
+            return subprocess.run(
+                [sys.executable, engine, "list"],
+                cwd=str(self.tmp),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+
+        def run_script(name):
+            return subprocess.run(
+                ["bash", str(SRC_DIR / "commands" / name)],
+                cwd=str(self.tmp),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+
+        for body in ("[]", json.dumps({"mcps": {"name": "x"}})):
+            index_path.write_text(body)
+            proc = run_list()
+            combined = proc.stdout + proc.stderr
+            self.assertEqual(proc.returncode, 1, combined)
+            self.assertIn(expected, combined)
+            self.assertNotIn("Traceback", combined)
+            for script in ("status.sh", "validate.sh"):
+                proc = run_script(script)
+                combined = proc.stdout + proc.stderr
+                self.assertEqual(proc.returncode, 1, combined)
+                self.assertIn(expected, combined)
+                self.assertNotIn("Traceback", combined)
+
+        index_path.write_text(
+            json.dumps(
+                {
+                    "mcps": [
+                        "skip-me",
+                        {
+                            "name": "counted",
+                            "inspected": True,
+                            "tool_count": None,
+                            "context_tokens": None,
+                            "format": "cli",
+                        },
+                    ]
+                }
+            )
+        )
+        listed = run_list()
+        listed_text = listed.stdout + listed.stderr
+        self.assertEqual(listed.returncode, 0, listed_text)
+        self.assertIn("counted", listed_text)
+        self.assertIn("0 tools", listed_text)
+        self.assertNotIn("Traceback", listed_text)
+        self.assertNotIn("None", listed_text)
+
+        status = run_script("status.sh")
+        status_text = status.stdout + status.stderr
+        self.assertEqual(status.returncode, 0, status_text)
+        self.assertIn("0 tools", status_text)
+        self.assertIn("~0 tokens", status_text)
+        self.assertNotIn("Traceback", status_text)
+        self.assertNotIn("None", status_text)
+
+        validate = run_script("validate.sh")
+        validate_text = validate.stdout + validate.stderr
+        self.assertEqual(validate.returncode, 0, validate_text)
+        self.assertIn("inspected, 0 tools", validate_text)
+        self.assertNotIn("Traceback", validate_text)
+        self.assertNotIn("None", validate_text)
+
+    def test_index_utf8_and_list_use_different_sentences(self):
+        """source: an index that was not UTF-8, or a JSON list, traced back or shared one sentence"""
+        registry = self.mcm_home / "registry"
+        registry.mkdir(parents=True)
+        index_path = registry / "index.json"
+        env = isolated_env(self.home)
+        engine = str(SRC_DIR / "mcm_engine.py")
+        json_sentence = (
+            "The registry index is not valid JSON: %s. Move it aside and run discover again."
+            % index_path
+        )
+        shape_sentence = (
+            "The registry index is not in the expected shape: %s. Move it aside and run discover again."
+            % index_path
+        )
+
+        def run_list():
+            return subprocess.run(
+                [sys.executable, engine, "list"],
+                cwd=str(self.tmp),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+
+        def run_script(name):
+            return subprocess.run(
+                ["bash", str(SRC_DIR / "commands" / name)],
+                cwd=str(self.tmp),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+
+        index_path.write_bytes(b"\xff\xfe{")
+        proc = run_list()
+        combined = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 1, combined)
+        self.assertIn(json_sentence, combined)
+        self.assertNotIn("expected shape", combined)
+        self.assertNotIn("Traceback", combined)
+        for script in ("status.sh", "validate.sh"):
+            proc = run_script(script)
+            combined = proc.stdout + proc.stderr
+            self.assertEqual(proc.returncode, 1, combined)
+            self.assertIn(json_sentence, combined)
+            self.assertNotIn("expected shape", combined)
+            self.assertNotIn("Traceback", combined)
+
+        index_path.write_text("[]")
+        proc = run_list()
+        combined = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 1, combined)
+        self.assertIn(shape_sentence, combined)
+        self.assertNotIn("not valid JSON", combined)
+        self.assertNotIn("Traceback", combined)
+        for script in ("status.sh", "validate.sh"):
+            proc = run_script(script)
+            combined = proc.stdout + proc.stderr
+            self.assertEqual(proc.returncode, 1, combined)
+            self.assertIn(shape_sentence, combined)
+            self.assertNotIn("not valid JSON", combined)
+            self.assertNotIn("Traceback", combined)
+
+    def test_non_finite_and_bool_counts_are_zero(self):
+        """source: a tool_count of NaN or true was shown as nan or 1 by list and status"""
+        registry = self.mcm_home / "registry"
+        registry.mkdir(parents=True)
+        index_path = registry / "index.json"
+        index_path.write_text(
+            "{"
+            '"mcps": ['
+            '{"name": "qty-float", "inspected": true, "tool_count": NaN, '
+            '"context_tokens": NaN, "format": "cli"},'
+            '{"name": "qty-flag", "inspected": true, "tool_count": true, '
+            '"context_tokens": true, "format": "cli"}'
+            "]"
+            "}"
+        )
+        env = isolated_env(self.home)
+        listed = subprocess.run(
+            [sys.executable, str(SRC_DIR / "mcm_engine.py"), "list"],
+            cwd=str(self.tmp),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        listed_text = listed.stdout + listed.stderr
+        self.assertEqual(listed.returncode, 0, listed_text)
+        self.assertNotIn("Traceback", listed_text)
+        for name in ("qty-float", "qty-flag"):
+            matches = [line for line in listed.stdout.splitlines() if name in line]
+            self.assertEqual(len(matches), 1, listed_text)
+            self.assertIn("0 tools", matches[0])
+            self.assertNotIn("nan", matches[0].lower())
+            self.assertNotIn("1 tools", matches[0])
+        status = subprocess.run(
+            ["bash", str(SRC_DIR / "commands" / "status.sh")],
+            cwd=str(self.tmp),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        status_text = status.stdout + status.stderr
+        self.assertEqual(status.returncode, 0, status_text)
+        self.assertNotIn("Traceback", status_text)
+        for name in ("qty-float", "qty-flag"):
+            matches = [line for line in status.stdout.splitlines() if name in line]
+            self.assertEqual(len(matches), 1, status_text)
+            self.assertIn("0 tools", matches[0])
+            self.assertIn("~0 tokens", matches[0])
+            self.assertNotIn("nan", matches[0].lower())
+            self.assertNotIn("1 tools", matches[0])
+
+    def _build_metadata(self, engine_mod, name, **overrides):
+        fields = {
+            "name": name,
+            "source": "npm",
+            "url": "https://www.npmjs.com/package/" + name,
+            "description": "saved description",
+            "tools": [],
+            "tool_count": 0,
+            "complexity_score": 0.0,
+            "context_cost_estimate": 0,
+            "dependencies": ["kept"],
+            "credentials_needed": [],
+            "discovered_at": "2020-01-01T00:00:00Z",
+            "format": "direct",
+        }
+        fields.update(overrides)
+        return engine_mod.MCPMetadata(**fields)
+
+    def _read_saved_metadata(self, name):
+        path = self.mcm_home / "registry" / name / "metadata.json"
+        try:
+            return json.loads(path.read_text())
+        except Exception as exc:
+            self.fail("saved metadata is not valid JSON: %r" % (exc,))
+
+    def test_rediscover_empty_dependencies_replace_saved_list(self):
+        """source: a re-discovered package kept dependencies that npm no longer lists"""
+        engine_mod = load_engine(self.mcm_home)
+        engine = engine_mod.MCMEngine()
+        try:
+            engine.save_metadata(
+                self._build_metadata(
+                    engine_mod,
+                    "deps-mcp",
+                    dependencies=["zod"],
+                    description="had deps",
+                )
+            )
+            engine.save_metadata(
+                self._build_metadata(
+                    engine_mod,
+                    "deps-mcp",
+                    dependencies=[],
+                    description="no deps",
+                    discovered_at="2021-01-01T00:00:00Z",
+                )
+            )
+        except Exception as exc:
+            self.fail("save_metadata raised %r" % (exc,))
+        saved = self._read_saved_metadata("deps-mcp")
+        self.assertEqual(saved["dependencies"], [])
+        self.assertEqual(saved["description"], "no deps")
+        self.assertEqual(saved["discovered_at"], "2021-01-01T00:00:00Z")
+
+    def test_inspect_after_discover_keeps_url_and_description(self):
+        """source: an inspected record with url None and an empty description replaced the url and description discover had saved"""
+        engine_mod = load_engine(self.mcm_home)
+        engine = engine_mod.MCMEngine()
+        discover_url = "https://www.npmjs.com/package/kept-mcp"
+        discover_description = "from npm"
+        tools = [{"name": "read_file", "description": "", "schema_size": 1}]
+        try:
+            engine.save_metadata(
+                self._build_metadata(
+                    engine_mod,
+                    "kept-mcp",
+                    url=discover_url,
+                    description=discover_description,
+                    dependencies=["zod"],
+                )
+            )
+            engine.save_metadata(
+                self._build_metadata(
+                    engine_mod,
+                    "kept-mcp",
+                    url=None,
+                    description="",
+                    dependencies=[],
+                    credentials_needed=[],
+                    tools=tools,
+                    tool_count=1,
+                    complexity_score=1.0,
+                    context_cost_estimate=180,
+                    format="cli",
+                    inspected=True,
+                    inspected_at="2020-02-01T00:00:00Z",
+                )
+            )
+        except Exception as exc:
+            self.fail("save_metadata raised %r" % (exc,))
+        saved = self._read_saved_metadata("kept-mcp")
+        self.assertEqual(saved["url"], discover_url)
+        self.assertEqual(saved["description"], discover_description)
+        self.assertEqual(saved["dependencies"], ["zod"])
+        self.assertEqual(saved["tools"], tools)
+        self.assertTrue(saved["inspected"])
+
+    def test_discover_after_inspect_keeps_tools_and_empty_description(self):
+        """source: a discover with an empty description after an inspect kept the saved description or dropped the tools"""
+        engine_mod = load_engine(self.mcm_home)
+        engine = engine_mod.MCMEngine()
+        tools = [
+            {"name": "read_file", "description": "Read a file", "schema_size": 42}
+        ]
+        try:
+            engine.save_metadata(
+                self._build_metadata(
+                    engine_mod,
+                    "again-mcp",
+                    description="from the earlier discover",
+                    dependencies=["zod"],
+                    tools=tools,
+                    tool_count=1,
+                    complexity_score=1.0,
+                    context_cost_estimate=180,
+                    format="cli",
+                    inspected=True,
+                    inspected_at="2020-02-01T00:00:00Z",
+                )
+            )
+            engine.save_metadata(
+                self._build_metadata(
+                    engine_mod,
+                    "again-mcp",
+                    description="",
+                    dependencies=[],
+                    url="https://www.npmjs.com/package/again-mcp",
+                    source="npm",
+                    discovered_at="2021-06-01T00:00:00Z",
+                )
+            )
+        except Exception as exc:
+            self.fail("save_metadata raised %r" % (exc,))
+        saved = self._read_saved_metadata("again-mcp")
+        self.assertEqual(saved["tools"], tools)
+        self.assertEqual(saved["description"], "")
+        self.assertEqual(saved["dependencies"], [])
+        self.assertEqual(saved["tool_count"], 1)
+        self.assertEqual(saved["complexity_score"], 1.0)
+        self.assertEqual(saved["context_cost_estimate"], 180)
+        self.assertEqual(saved["format"], "cli")
+        self.assertTrue(saved["inspected"])
+        self.assertEqual(saved["inspected_at"], "2020-02-01T00:00:00Z")
+        self.assertEqual(saved["discovered_at"], "2021-06-01T00:00:00Z")
+        self.assertEqual(saved["url"], "https://www.npmjs.com/package/again-mcp")
+        self.assertEqual(saved["source"], "npm")
+
+    def test_empty_description_and_null_url_keep_saved_values(self):
+        """source: an empty description on a later discover replaces the saved description, and an inspected url of None keeps the saved url"""
+        engine_mod = load_engine(self.mcm_home)
+        engine = engine_mod.MCMEngine()
+
+        try:
+            engine.save_metadata(self._build_metadata(engine_mod, "desc-mcp"))
+            engine.save_metadata(
+                self._build_metadata(engine_mod, "desc-mcp", description="")
+            )
+        except Exception as exc:
+            self.fail("save_metadata raised %r" % (exc,))
+        saved = self._read_saved_metadata("desc-mcp")
+        self.assertEqual(saved["description"], "")
+
+        try:
+            engine.save_metadata(
+                self._build_metadata(
+                    engine_mod, "url-mcp", url="https://saved.example/kept"
+                )
+            )
+            engine.save_metadata(
+                self._build_metadata(
+                    engine_mod,
+                    "url-mcp",
+                    url=None,
+                    inspected=True,
+                    inspected_at="2020-02-01T00:00:00Z",
+                    tools=[{"name": "a", "description": "", "schema_size": 1}],
+                    tool_count=1,
+                    format="cli",
+                )
+            )
+        except Exception as exc:
+            self.fail("save_metadata raised %r" % (exc,))
+        url_path = self.mcm_home / "registry" / "url-mcp" / "metadata.json"
+        try:
+            saved_url = json.loads(url_path.read_text())
+        except Exception as exc:
+            self.fail("saved url metadata is not valid JSON: %r" % (exc,))
+        self.assertEqual(saved_url["url"], "https://saved.example/kept")
+
+    def test_save_metadata_reports_unreadable_and_wrong_shaped_index(self):
+        """source: save_metadata rewrote an index that was not UTF-8 or not an object"""
+        engine_mod = load_engine(self.mcm_home)
+        engine = engine_mod.MCMEngine()
+        index_path = self.mcm_home / "registry" / "index.json"
+        index_path.parent.mkdir(parents=True, exist_ok=True)
+        index_path.write_bytes(b"\xff\xfe")
+        with self.assertRaises(ValueError) as ctx:
+            engine.save_metadata(self._metadata(engine_mod))
+        self.assertEqual(
+            str(ctx.exception),
+            "The registry index is not valid JSON: %s. Move it aside and run discover again."
+            % index_path,
+        )
+        index_path.write_text("[]")
+        with self.assertRaises(ValueError) as ctx:
+            engine.save_metadata(self._metadata(engine_mod))
+        self.assertEqual(
+            str(ctx.exception),
+            "The registry index is not in the expected shape: %s. Move it aside and run discover again."
+            % index_path,
+        )
+        index_path.write_text('{"mcps": {"name": "x"}}')
+        with self.assertRaises(ValueError) as ctx:
+            engine.save_metadata(self._metadata(engine_mod))
+        self.assertEqual(
+            str(ctx.exception),
+            "The registry index is not in the expected shape: %s. Move it aside and run discover again."
+            % index_path,
+        )
 
 
 if __name__ == "__main__":
