@@ -19,10 +19,13 @@ if [[ -f "$MCM_HOME/registry/index.json" ]]; then
     echo ""
     python3 - "$MCM_HOME/registry/index.json" <<'PY'
 import json
+import math
 import sys
 
 def as_count(value):
     if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    if not math.isfinite(value):
         return 0
     return value
 
@@ -35,15 +38,23 @@ def invalid(path):
     sys.exit(1)
 
 
+def bad_shape(path):
+    print(
+        "The registry index is not in the expected shape: %s. Move it aside and run discover again."
+        % path
+    )
+    sys.exit(1)
+
+
 path = sys.argv[1]
 try:
-    with open(path) as handle:
+    with open(path, encoding="utf-8") as handle:
         data = json.load(handle)
-except json.JSONDecodeError:
+except (OSError, ValueError, RecursionError):
     invalid(path)
 
 if not isinstance(data, dict) or not isinstance(data.get("mcps", []), list):
-    invalid(path)
+    bad_shape(path)
 
 mcps = data.get("mcps", [])
 print("Discovered MCPs: %d" % len(mcps))
