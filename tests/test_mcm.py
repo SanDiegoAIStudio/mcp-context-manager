@@ -331,6 +331,59 @@ class InstallScriptTests(IsolatedHomeTest):
         self.assertNotIn("search, review, and compare", text)
         self.assertNotIn("\u2014", text)
 
+    def test_readme_npm_discover_stays_on_the_registry(self):
+        """source: the README said an npm package's owner/repo is sent to api.github.com"""
+        text = (REPO_ROOT / "README.md").read_text()
+        self.assertIn(
+            "* discover sends each npm package name you give it to registry.npmjs.org and nowhere else.",
+            text,
+        )
+        self.assertIn(
+            "* For a GitHub repository URL, discover sends the owner/repo to api.github.com (with GITHUB_TOKEN if you set it) and reads the repository's package.json from raw.githubusercontent.com.",
+            text,
+        )
+        self.assertNotIn(
+            "For a package whose repository is on GitHub, it sends the owner/repo to api.github.com",
+            text,
+        )
+
+    def test_install_rejects_python_older_than_39(self):
+        """source: the installer accepted any python3, but the engine needs Python 3.9"""
+        bindir = self.tmp / "bin"
+        bindir.mkdir()
+        wrapper = bindir / "python3"
+        wrapper.write_text("#!/bin/bash\necho 'Python 3.8.10'\n")
+        os.chmod(str(wrapper), 0o755)
+        env = isolated_env(self.home)
+        env["PATH"] = str(bindir) + os.pathsep + env.get("PATH", "")
+        proc = subprocess.run(
+            ["bash", str(REPO_ROOT / "install.sh")],
+            cwd=str(REPO_ROOT),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        combined = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 1, combined)
+        self.assertIn(
+            "\u2717 Python 3.9 or newer is required (found 3.8.10)",
+            combined,
+        )
+        self.assertEqual(sorted(path.name for path in self.home.iterdir()), [])
+
+    def test_readme_requires_python_39_and_names_proxy_settings(self):
+        """source: the README required Python 3.10 and did not list proxy settings passed to npx"""
+        text = (REPO_ROOT / "README.md").read_text()
+        self.assertIn("python-3.9+-blue", text)
+        self.assertIn("Python 3.9+", text)
+        self.assertNotIn("python-3.10+", text)
+        self.assertNotIn("Python 3.10+", text)
+        self.assertIn(
+            "It passes only PATH, HOME, USER, LANG and TMPDIR from your environment, plus proxy and certificate settings when they are set (HTTP_PROXY, HTTPS_PROXY, NO_PROXY, ALL_PROXY, NODE_EXTRA_CA_CERTS, SSL_CERT_FILE, SSL_CERT_DIR).",
+            text,
+        )
+
 
 class ParseMcpInputTests(IsolatedHomeTest):
     def test_parse_mcp_input_skips_comments_and_classifies_names(self):
@@ -738,51 +791,49 @@ class NpmDiscoverTests(IsolatedHomeTest):
             buf.getvalue(),
         )
 
-    def test_github_repo_from_known_forms_and_rejections(self):
-        """source: review: a string repository or an ssh address was not turned into owner/repo"""
-        engine_mod = load_engine(self.mcm_home)
-        forms = [
-            "https://github.com/owner/repo",
-            "https://github.com/owner/repo.git",
-            "https://github.com/owner/repo/",
-            "https://github.com/owner/repo.git/",
-            "https://github.com/owner/repo#fragment",
-            "https://github.com/owner/repo/tree/main",
-            "https://github.com/owner/repo/tree/main/src",
-            "git+https://github.com/owner/repo.git",
-            "git://github.com/owner/repo.git",
-            "git@github.com:owner/repo.git",
-            "ssh://git@github.com/owner/repo.git",
-            "github:owner/repo",
-            "owner/repo",
-            {"url": "https://github.com/owner/repo.git"},
-            {"type": "git", "url": "git+https://github.com/owner/repo.git"},
-        ]
-        for form in forms:
-            self.assertEqual(
-                engine_mod.github_repo_from(form),
-                "owner/repo",
-                form,
-            )
-        for form in (
-            "https://gitlab.com/owner/repo",
-            "git@example.test:owner/repo.git",
-            "owner/../x",
-            None,
-            42,
-        ):
-            self.assertIsNone(engine_mod.github_repo_from(form), form)
+    def _read_json_object(self, path):
+        try:
+            data = json.loads(Path(path).read_text())
+        except Exception as exc:
+            self.fail("%s is not valid JSON: %r" % (path, exc))
+        self.assertIsInstance(data, dict)
+        return data
 
-    def test_discover_from_npm_string_repository_asks_github(self):
-        """source: review: an npm repository string raised AttributeError"""
+    def _inspected_metadata(self, engine_mod, name, tools, tokens, at):
+        return engine_mod.MCPMetadata(
+            name=name,
+            source="npm",
+            url="https://www.npmjs.com/package/" + name,
+            description="",
+            tools=tools,
+            tool_count=len(tools),
+            complexity_score=float(len(tools)),
+            context_cost_estimate=tokens,
+            dependencies=[],
+            credentials_needed=[],
+            discovered_at=at,
+            format="cli",
+            inspected=True,
+            inspected_at=at,
+        )
+
+    def test_discover_from_npm_github_repository_asks_only_the_registry(self):
+        """source: discover fetched a GitHub repository for an npm package and saved the monorepo, not the package"""
         engine_mod = load_engine(self.mcm_home)
+        package_name = "@modelcontextprotocol/server-filesystem"
+        description = "Filesystem MCP server"
+        dependencies = ["zod", "diff"]
         npm_doc = {
-            "name": "string-repo",
-            "dist-tags": {"latest": "1.0.0"},
+            "name": "servers",
+            "dist-tags": {"latest": "1.2.3"},
             "versions": {
-                "1.0.0": {
-                    "description": "from npm",
-                    "repository": "github:owner/repo",
+                "1.2.3": {
+                    "description": description,
+                    "repository": {
+                        "type": "git",
+                        "url": "git+https://github.com/modelcontextprotocol/servers.git",
+                    },
+                    "dependencies": {"zod": "^3.22.4", "diff": "^5.1.0"},
                 }
             },
         }
@@ -790,73 +841,298 @@ class NpmDiscoverTests(IsolatedHomeTest):
 
         def fake_http(method, url, headers=None, json_body=None, timeout=30):
             recorded.append(url)
-            if "registry.npmjs.org" in url:
+            if url == "https://registry.npmjs.org/" + package_name:
                 return (200, json.dumps(npm_doc))
-            if url == "https://api.github.com/repos/owner/repo":
-                return (
-                    200,
-                    json.dumps(
-                        {
-                            "name": "repo",
-                            "html_url": "https://github.com/owner/repo",
-                            "description": "from github",
-                            "default_branch": "main",
-                        }
-                    ),
-                )
-            return (404, "")
+            return (500, url)
 
         engine = engine_mod.MCMEngine()
         with patch.object(engine_mod, "http_request", side_effect=fake_http):
-            metadata = engine.discover_from_npm(
-                {"identifier": "string-repo", "type": "npm_package"}
-            )
-        self.assertIn("https://api.github.com/repos/owner/repo", recorded)
-        self.assertEqual(metadata.name, "string-repo")
+            try:
+                metadata = engine.discover_from_npm(
+                    {"identifier": package_name, "type": "npm_official"}
+                )
+            except Exception as exc:
+                self.fail("discover_from_npm raised %r" % (exc,))
+        self.assertEqual(
+            recorded,
+            ["https://registry.npmjs.org/" + package_name],
+        )
+        self.assertEqual(metadata.name, package_name)
+        self.assertEqual(metadata.source, "npm")
+        self.assertEqual(
+            metadata.url,
+            "https://www.npmjs.com/package/" + package_name,
+        )
+        self.assertEqual(metadata.description, description)
+        self.assertEqual(metadata.dependencies, dependencies)
+        self.assertEqual(metadata.format, "direct")
+        try:
+            engine.save_metadata(metadata)
+        except Exception as exc:
+            self.fail("save_metadata raised %r" % (exc,))
+        saved = self._read_json_object(
+            self.mcm_home
+            / "registry"
+            / "@modelcontextprotocol"
+            / "server-filesystem"
+            / "metadata.json"
+        )
+        self.assertEqual(saved["name"], package_name)
+        self.assertEqual(saved["description"], description)
+        self.assertEqual(saved["dependencies"], dependencies)
 
-    def test_discover_from_npm_keeps_npm_details_when_github_fails(self):
-        """source: review: a failed GitHub lookup discarded the npm details already fetched"""
+    def test_discover_from_npm_string_and_shorthand_repository_ask_only_the_registry(self):
+        """source: an npm repository string or github: shorthand was sent to api.github.com"""
         engine_mod = load_engine(self.mcm_home)
+        engine = engine_mod.MCMEngine()
+        cases = (
+            (
+                "string-repo",
+                "https://github.com/owner/repo.git",
+                "Description from the string repository package",
+            ),
+            (
+                "shorthand-repo",
+                "github:owner/repo",
+                "Description from the shorthand repository package",
+            ),
+        )
+        for package_name, repository, description in cases:
+            npm_doc = {
+                "name": "monorepo",
+                "dist-tags": {"latest": "1.0.0"},
+                "versions": {
+                    "1.0.0": {
+                        "description": description,
+                        "repository": repository,
+                        "dependencies": {"left-pad": "1.0.0"},
+                    }
+                },
+            }
+            recorded = []
+
+            def fake_http(
+                method,
+                url,
+                headers=None,
+                json_body=None,
+                timeout=30,
+                _recorded=recorded,
+                _doc=npm_doc,
+                _name=package_name,
+            ):
+                _recorded.append(url)
+                if url == "https://registry.npmjs.org/" + _name:
+                    return (200, json.dumps(_doc))
+                return (500, url)
+
+            with patch.object(engine_mod, "http_request", side_effect=fake_http):
+                try:
+                    metadata = engine.discover_from_npm(
+                        {"identifier": package_name, "type": "npm_package"}
+                    )
+                except Exception as exc:
+                    self.fail(
+                        "discover_from_npm raised %r for %s" % (exc, package_name)
+                    )
+            self.assertEqual(
+                recorded,
+                ["https://registry.npmjs.org/" + package_name],
+                package_name,
+            )
+            self.assertEqual(metadata.name, package_name, package_name)
+            self.assertEqual(metadata.source, "npm", package_name)
+            self.assertEqual(metadata.description, description, package_name)
+            self.assertEqual(metadata.dependencies, ["left-pad"], package_name)
+            try:
+                engine.save_metadata(metadata)
+            except Exception as exc:
+                self.fail("save_metadata raised %r for %s" % (exc, package_name))
+            saved = self._read_json_object(
+                self.mcm_home / "registry" / package_name / "metadata.json"
+            )
+            self.assertEqual(saved["description"], description, package_name)
+            self.assertEqual(saved["dependencies"], ["left-pad"], package_name)
+
+    def test_discover_from_npm_missing_latest_reports_the_package(self):
+        """source: an npm registry answer with no latest version raised KeyError instead of naming the package"""
+        engine_mod = load_engine(self.mcm_home)
+        engine = engine_mod.MCMEngine()
+        answers = (
+            {"name": "demo-mcp"},
+            {
+                "name": "demo-mcp",
+                "dist-tags": {"latest": "9.9.9"},
+                "versions": {"1.0.0": {"description": "present"}},
+            },
+        )
+        expected = "npm registry answer for demo-mcp has no latest version"
+        for npm_doc in answers:
+            def fake_http(
+                method,
+                url,
+                headers=None,
+                json_body=None,
+                timeout=30,
+                _doc=npm_doc,
+            ):
+                return (200, json.dumps(_doc))
+
+            with patch.object(engine_mod, "http_request", side_effect=fake_http):
+                with self.assertRaises(Exception) as ctx:
+                    engine.discover_from_npm(
+                        {"identifier": "demo-mcp", "type": "npm_package"}
+                    )
+            self.assertEqual(type(ctx.exception), Exception)
+            self.assertEqual(str(ctx.exception), expected)
+
+    def test_discover_then_inspect_keeps_description_and_tools(self):
+        """source: inspect saved an empty description and empty dependencies, wiping what discover had saved"""
+        engine_mod = load_engine(self.mcm_home)
+        package_name = "demo-mcp"
+        description = "Package description from npm"
+        dependencies = ["zod"]
         npm_doc = {
-            "name": "blocked-mcp",
+            "name": "servers",
             "dist-tags": {"latest": "1.0.0"},
             "versions": {
                 "1.0.0": {
-                    "description": "Saved anyway",
-                    "repository": {"url": "https://github.com/owner/repo"},
-                    "dependencies": {"left-pad": "1.0.0"},
+                    "description": description,
+                    "repository": {
+                        "type": "git",
+                        "url": "git+https://github.com/modelcontextprotocol/servers.git",
+                    },
+                    "dependencies": {"zod": "3.22.4"},
                 }
             },
         }
 
         def fake_http(method, url, headers=None, json_body=None, timeout=30):
-            if "registry.npmjs.org" in url:
+            if url == "https://registry.npmjs.org/" + package_name:
                 return (200, json.dumps(npm_doc))
-            if "api.github.com" in url:
-                return (403, "")
-            return (404, "")
+            return (500, url)
 
         engine = engine_mod.MCMEngine()
-        buf = io.StringIO()
+        with patch.object(engine_mod, "http_request", side_effect=fake_http):
+            try:
+                discovered = engine.discover_from_npm(
+                    {"identifier": package_name, "type": "npm_package"}
+                )
+            except Exception as exc:
+                self.fail("discover_from_npm raised %r" % (exc,))
         try:
-            with patch.object(engine_mod, "http_request", side_effect=fake_http):
-                with contextlib.redirect_stdout(buf):
-                    metadata = engine.discover_from_npm(
-                        {"identifier": "blocked-mcp", "type": "npm_package"}
-                    )
+            engine.save_metadata(discovered)
         except Exception as exc:
-            self.fail(
-                "a failed GitHub lookup aborted npm discovery: %s" % exc
-            )
-        self.assertIsNotNone(metadata)
-        self.assertEqual(metadata.name, "blocked-mcp")
-        self.assertEqual(metadata.source, "npm")
-        self.assertEqual(metadata.description, "Saved anyway")
-        self.assertEqual(metadata.dependencies, ["left-pad"])
-        self.assertEqual(
-            metadata.url, "https://www.npmjs.com/package/blocked-mcp"
+            self.fail("discover save_metadata raised %r" % (exc,))
+        tools = [
+            {"name": "read_file", "description": "Read a file", "schema_size": 42}
+        ]
+        inspected = self._inspected_metadata(
+            engine_mod,
+            package_name,
+            tools,
+            180,
+            "2024-05-01T00:00:00Z",
         )
-        self.assertIn("GitHub details unavailable", buf.getvalue())
+        try:
+            engine.save_metadata(inspected)
+        except Exception as exc:
+            self.fail("inspect save_metadata raised %r" % (exc,))
+        saved = self._read_json_object(
+            self.mcm_home / "registry" / package_name / "metadata.json"
+        )
+        self.assertEqual(saved.get("description"), description)
+        self.assertEqual(saved.get("dependencies"), dependencies)
+        self.assertEqual(saved["tools"], tools)
+        self.assertTrue(saved["inspected"])
+        self.assertEqual(saved["tool_count"], 1)
+        self.assertEqual(saved["format"], "cli")
+        self.assertEqual(saved["context_cost_estimate"], 180)
+        self.assertEqual(saved["discovered_at"], discovered.discovered_at)
+        self.assertEqual(saved["inspected_at"], "2024-05-01T00:00:00Z")
+        index = self._read_json_object(self.mcm_home / "registry" / "index.json")
+        matches = [
+            item for item in index["mcps"] if item.get("name") == package_name
+        ]
+        self.assertEqual(len(matches), 1)
+        entry = matches[0]
+        self.assertTrue(entry["inspected"])
+        self.assertEqual(entry["tool_count"], 1)
+        self.assertEqual(entry["context_tokens"], 180)
+
+    def test_inspect_then_discover_keeps_tools_and_gains_npm_details(self):
+        """source: a discover after an inspect was dropped, so the description never arrived"""
+        engine_mod = load_engine(self.mcm_home)
+        package_name = "demo-mcp"
+        description = "Package description from npm"
+        dependencies = ["zod"]
+        tools = [
+            {"name": "read_file", "description": "Read a file", "schema_size": 42}
+        ]
+        npm_doc = {
+            "name": "servers",
+            "dist-tags": {"latest": "1.0.0"},
+            "versions": {
+                "1.0.0": {
+                    "description": description,
+                    "repository": {
+                        "type": "git",
+                        "url": "git+https://github.com/modelcontextprotocol/servers.git",
+                    },
+                    "dependencies": {"zod": "3.22.4"},
+                }
+            },
+        }
+
+        def fake_http(method, url, headers=None, json_body=None, timeout=30):
+            if url == "https://registry.npmjs.org/" + package_name:
+                return (200, json.dumps(npm_doc))
+            return (500, url)
+
+        engine = engine_mod.MCMEngine()
+        inspected = self._inspected_metadata(
+            engine_mod,
+            package_name,
+            tools,
+            180,
+            "2024-05-01T00:00:00Z",
+        )
+        try:
+            engine.save_metadata(inspected)
+        except Exception as exc:
+            self.fail("inspect save_metadata raised %r" % (exc,))
+        with patch.object(engine_mod, "http_request", side_effect=fake_http):
+            try:
+                discovered = engine.discover_from_npm(
+                    {"identifier": package_name, "type": "npm_package"}
+                )
+            except Exception as exc:
+                self.fail("discover_from_npm raised %r" % (exc,))
+        try:
+            engine.save_metadata(discovered)
+        except Exception as exc:
+            self.fail("discover save_metadata raised %r" % (exc,))
+        saved = self._read_json_object(
+            self.mcm_home / "registry" / package_name / "metadata.json"
+        )
+        self.assertEqual(saved["tools"], tools)
+        self.assertTrue(saved["inspected"])
+        self.assertEqual(saved["tool_count"], 1)
+        self.assertEqual(saved["description"], description)
+        self.assertEqual(saved["dependencies"], dependencies)
+        self.assertEqual(saved["inspected_at"], "2024-05-01T00:00:00Z")
+        self.assertEqual(saved["format"], "cli")
+        self.assertEqual(saved["context_cost_estimate"], 180)
+        self.assertEqual(saved["discovered_at"], discovered.discovered_at)
+        index = self._read_json_object(self.mcm_home / "registry" / "index.json")
+        matches = [
+            item for item in index["mcps"] if item.get("name") == package_name
+        ]
+        self.assertEqual(len(matches), 1)
+        entry = matches[0]
+        self.assertTrue(entry["inspected"])
+        self.assertEqual(entry["tool_count"], 1)
+        self.assertEqual(entry["context_tokens"], 180)
 
     def test_discover_from_github_reads_default_branch_package_json(self):
         """source: review: package.json was read from main before the repository default branch"""
@@ -1038,6 +1314,47 @@ class NpmDiscoverTests(IsolatedHomeTest):
         self.assertEqual(tools[0]["description"], "first second")
         self.assertIn(" ", tools[0]["description"])
         self.assertNotIn("\n", tools[0]["description"])
+
+    def test_discover_from_github_wrong_package_json_shape(self):
+        """source: a package.json that was a JSON list, or whose dependencies was a string, raised during discovery"""
+        engine_mod = load_engine(self.mcm_home)
+
+        def discover(package_body):
+            def fake_http(method, url, headers=None, json_body=None, timeout=30):
+                if "api.github.com" in url:
+                    return (
+                        200,
+                        json.dumps(
+                            {
+                                "name": "repo",
+                                "html_url": "https://github.com/owner/repo",
+                                "description": "d",
+                            }
+                        ),
+                    )
+                if url.endswith("/package.json"):
+                    return (200, package_body)
+                return (404, "")
+
+            engine = engine_mod.MCMEngine()
+            buf = io.StringIO()
+            with patch.object(engine_mod, "http_request", side_effect=fake_http):
+                with contextlib.redirect_stdout(buf):
+                    try:
+                        return engine.discover_from_github(
+                            {"identifier": "owner/repo", "type": "github_url"}
+                        )
+                    except Exception as exc:
+                        self.fail("discover_from_github raised %r" % (exc,))
+
+        listed = discover("[1, 2, 3]")
+        self.assertIsNotNone(listed)
+        self.assertEqual(listed.name, "repo")
+        self.assertEqual(listed.dependencies, [])
+        text_deps = discover(json.dumps({"dependencies": "zod"}))
+        self.assertIsNotNone(text_deps)
+        self.assertEqual(text_deps.name, "repo")
+        self.assertEqual(text_deps.dependencies, [])
 
 
 class InputSafetyTests(IsolatedHomeTest):
@@ -2051,7 +2368,9 @@ class InspectTests(IsolatedHomeTest):
         self.assertLess(elapsed, 6)
         self.assertIn("did not answer within 2 seconds", message)
         self.assertTrue(
-            message.endswith(" (1 line(s) of its output were not JSON-RPC)"),
+            message.endswith(
+                " (1 line(s) of its output were not JSON-RPC). If npx was still downloading the package, run it again."
+            ),
             message,
         )
 
@@ -2406,7 +2725,7 @@ class InspectTests(IsolatedHomeTest):
         popen.assert_not_called()
 
     def test_save_metadata_keeps_inspected_entry(self):
-        """source: rail: saving a package again without inspection keeps the inspected tool count"""
+        """source: a discover after an inspect dropped the description, and a later save could drop the inspected tool count"""
         engine_mod = load_engine(self.mcm_home)
         engine = engine_mod.MCMEngine()
         inspected = engine_mod.MCPMetadata(
@@ -2442,15 +2761,245 @@ class InspectTests(IsolatedHomeTest):
             discovered_at="2021-01-01T00:00:00Z",
             format="direct",
         )
-        engine.save_metadata(inspected)
+        try:
+            engine.save_metadata(inspected)
+            engine.save_metadata(plain)
+        except Exception as exc:
+            self.fail("save_metadata raised %r" % (exc,))
         meta_path = self.mcm_home / "registry" / "demo-mcp" / "metadata.json"
-        before = meta_path.read_text()
-        engine.save_metadata(plain)
-        self.assertEqual(meta_path.read_text(), before)
-        index = json.loads((self.mcm_home / "registry" / "index.json").read_text())
-        entry = [item for item in index["mcps"] if item["name"] == "demo-mcp"][0]
+        try:
+            saved = json.loads(meta_path.read_text())
+        except Exception as exc:
+            self.fail("saved metadata is not valid JSON: %r" % (exc,))
+        self.assertEqual(saved["description"], "later")
+        self.assertEqual(
+            saved["tools"],
+            [
+                {"name": "a", "description": "", "schema_size": 1},
+                {"name": "b", "description": "", "schema_size": 2},
+            ],
+        )
+        self.assertEqual(saved["tool_count"], 2)
+        self.assertEqual(saved["complexity_score"], 2.0)
+        self.assertEqual(saved["context_cost_estimate"], 10)
+        self.assertEqual(saved["format"], "cli")
+        self.assertTrue(saved["inspected"])
+        self.assertEqual(saved["inspected_at"], "2020-01-01T00:00:00Z")
+        self.assertEqual(saved["discovered_at"], "2021-01-01T00:00:00Z")
+        try:
+            index = json.loads(
+                (self.mcm_home / "registry" / "index.json").read_text()
+            )
+        except Exception as exc:
+            self.fail("registry index is not valid JSON: %r" % (exc,))
+        matches = [
+            item for item in index["mcps"] if item.get("name") == "demo-mcp"
+        ]
+        self.assertEqual(len(matches), 1)
+        entry = matches[0]
         self.assertTrue(entry["inspected"])
         self.assertEqual(entry["tool_count"], 2)
+        self.assertEqual(entry["context_tokens"], 10)
+
+    def test_inspect_passes_proxy_and_certificate_settings(self):
+        """source: inspect passed no proxy or certificate settings to npx, so a download behind a proxy failed"""
+        engine_mod = load_engine(self.mcm_home)
+        report = self.tmp / "env-report.json"
+        names = ("HTTPS_PROXY", "NODE_EXTRA_CA_CERTS", "SECRET_TOKEN")
+        saved = {}
+        for key in names:
+            saved[key] = os.environ.get(key)
+        os.environ["HTTPS_PROXY"] = "http://proxy.example:8080"
+        os.environ["NODE_EXTRA_CA_CERTS"] = "/tmp/ca.pem"
+        os.environ["SECRET_TOKEN"] = "secret-value"
+        try:
+            try:
+                engine_mod.inspect_command(
+                    [sys.executable, FAKE, "env", str(report)], timeout=10
+                )
+            except Exception as exc:
+                self.fail("env mode inspect raised: %s" % exc)
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+        try:
+            info = json.loads(report.read_text())
+        except Exception as exc:
+            self.fail("env report is not valid JSON: %r" % (exc,))
+        seen = info["keys"]
+        self.assertIn("HTTPS_PROXY", seen)
+        self.assertIn("NODE_EXTRA_CA_CERTS", seen)
+        self.assertNotIn("SECRET_TOKEN", seen)
+
+    def test_inspect_timeout_says_to_run_again(self):
+        """source: a timeout during the first download gave no hint to run it again"""
+        engine_mod = load_engine(self.mcm_home)
+        started = time.monotonic()
+        with self.assertRaises(engine_mod.InspectError) as ctx:
+            engine_mod.inspect_command(
+                [sys.executable, "-c", "import sys; sys.stdin.read()"],
+                timeout=1,
+            )
+        self.assertLess(time.monotonic() - started, 6)
+        message = str(ctx.exception)
+        self.assertTrue(
+            message.endswith(
+                " If npx was still downloading the package, run it again."
+            ),
+            message,
+        )
+
+    def test_inspect_notes_when_tools_exceed_twenty_pages(self):
+        """source: a server with more than 20 pages of tools was read without saying pages were left"""
+        engine_mod = load_engine(self.mcm_home)
+        notes = []
+        try:
+            tools, _tokens = engine_mod.inspect_command(
+                [sys.executable, FAKE, "endless"], timeout=10, notes=notes
+            )
+        except Exception as exc:
+            self.fail("extra tool pages aborted inspect: %s" % exc)
+        self.assertEqual(len(tools), 20)
+        self.assertIn(
+            "the server has more than 20 pages of tools; only the first 20 pages were read",
+            notes,
+        )
+
+    def test_inspect_skips_deeply_nested_json(self):
+        """source: a deeply nested JSON line raised RecursionError and aborted inspect"""
+        engine_mod = load_engine(self.mcm_home)
+        notes = []
+        try:
+            tools, _tokens = engine_mod.inspect_command(
+                [sys.executable, FAKE, "deep"], timeout=10, notes=notes
+            )
+        except Exception as exc:
+            self.fail("a deeply nested line aborted inspect: %s" % exc)
+        names = [tool["name"] for tool in tools]
+        self.assertEqual(names, ["read_file", "bare"])
+        self.assertEqual(
+            notes,
+            [
+                "the server wrote 1 line(s) to its output that are not JSON-RPC; they were ignored"
+            ],
+        )
+
+    def test_inspect_ignores_boolean_id(self):
+        """source: an answer whose id was true was taken as the answer to request 1"""
+        engine_mod = load_engine(self.mcm_home)
+        try:
+            ok_tools, _ok_tokens = engine_mod.inspect_command(
+                [sys.executable, FAKE, "ok"], timeout=10
+            )
+        except Exception as exc:
+            self.fail("ok mode inspect raised: %s" % exc)
+        try:
+            tools, _tokens = engine_mod.inspect_command(
+                [sys.executable, FAKE, "bool_id"], timeout=10
+            )
+        except Exception as exc:
+            self.fail(
+                "an answer whose id is true was taken as the answer: %s" % exc
+            )
+        self.assertEqual(
+            [tool["name"] for tool in tools],
+            [tool["name"] for tool in ok_tools],
+        )
+
+    def test_clean_tools_drops_empty_names_and_limits_length(self):
+        """source: a tool name of only controls, longer than 200 characters, or holding bidi overrides was saved"""
+        engine_mod = load_engine(self.mcm_home)
+        raw = [
+            {"name": "\u0001\u001b", "description": "x"},
+            {"name": "a" * 500, "description": ""},
+            {"name": "ab\u202ecd\u200bef", "description": ""},
+        ]
+        try:
+            tools = engine_mod._clean_tools(raw)
+        except Exception as exc:
+            self.fail("_clean_tools raised %r" % (exc,))
+        names = [tool["name"] for tool in tools]
+        self.assertEqual(len(names), 2)
+        self.assertEqual(names[0], "a" * 200)
+        self.assertEqual(len(names[0]), 200)
+        self.assertEqual(names[1], "abcdef")
+        self.assertNotIn("\u202e", names[1])
+        self.assertNotIn("\u200b", names[1])
+
+    def test_read_stderr_tail_reads_only_the_end(self):
+        """source: a large stderr file was read in full"""
+        engine_mod = load_engine(self.mcm_home)
+        path = self.tmp / "stderr.txt"
+        body = b"S" + (b"m" * (1024 * 1024)) + b"E"
+        path.write_bytes(body)
+        try:
+            text = engine_mod._read_stderr_tail(str(path))
+        except Exception as exc:
+            self.fail("_read_stderr_tail raised %r" % (exc,))
+        encoded = text.encode("utf-8")
+        self.assertLessEqual(len(encoded), 4096)
+        self.assertEqual(encoded, body[-4096:])
+        self.assertTrue(body.endswith(encoded))
+        self.assertNotIn("S", text)
+
+    def test_inspect_start_failures_do_not_traceback(self):
+        """source: an OSError starting npx, or end of input at Continue, printed a traceback"""
+        engine_mod = load_engine(self.mcm_home)
+        engine = engine_mod.MCMEngine()
+
+        class _TtyStdin(io.StringIO):
+            def isatty(self):
+                return True
+
+        out = io.StringIO()
+        err = io.StringIO()
+        escaped = None
+        code = None
+        with patch.object(
+            engine_mod.sys, "argv", ["mcm_engine.py", "inspect", "demo-pkg", "--yes"]
+        ), patch.object(
+            engine_mod.shutil, "which", return_value="/usr/bin/npx"
+        ), patch.object(
+            engine_mod.subprocess, "Popen", side_effect=OSError("boom")
+        ), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                engine_mod._cmd_inspect(engine)
+            except SystemExit as exc:
+                code = exc.code
+            except Exception as exc:
+                escaped = exc
+        self.assertIsNone(escaped, "raised %r" % (escaped,))
+        self.assertEqual(code, 1)
+        combined = out.getvalue() + err.getvalue()
+        self.assertIn("Error: could not start npx (boom)", combined)
+        self.assertNotIn("Traceback", combined)
+
+        out = io.StringIO()
+        err = io.StringIO()
+        escaped = None
+        code = None
+        tty = _TtyStdin("")
+        with patch.object(
+            engine_mod.sys, "argv", ["mcm_engine.py", "inspect", "demo-pkg"]
+        ), patch.object(
+            engine_mod.shutil, "which", return_value="/usr/bin/npx"
+        ), patch.object(
+            engine_mod.sys, "stdin", tty
+        ), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                engine_mod._cmd_inspect(engine)
+            except SystemExit as exc:
+                code = exc.code
+            except Exception as exc:
+                escaped = exc
+        self.assertIsNone(escaped, "raised %r" % (escaped,))
+        self.assertEqual(code, 1)
+        combined = out.getvalue() + err.getvalue()
+        self.assertIn("Not started.", combined)
+        self.assertNotIn("Traceback", combined)
 
 
 class RegistryIndexTests(IsolatedHomeTest):
@@ -2555,6 +3104,146 @@ class RegistryIndexTests(IsolatedHomeTest):
                 if name.startswith(".mcm-tmp-"):
                     leftover.append(os.path.join(dirpath, name))
         self.assertEqual(leftover, [])
+
+    def test_save_metadata_replaces_metadata_that_is_not_json(self):
+        """source: a saved metadata.json holding the text not json, or not an object, aborted the next save"""
+        engine_mod = load_engine(self.mcm_home)
+        engine = engine_mod.MCMEngine()
+        meta_path = self.mcm_home / "registry" / "demo-mcp" / "metadata.json"
+        meta_path.parent.mkdir(parents=True, exist_ok=True)
+        meta_path.write_text("not json")
+        try:
+            engine.save_metadata(self._metadata(engine_mod))
+        except Exception as exc:
+            self.fail("save_metadata raised %r" % (exc,))
+        try:
+            saved = json.loads(meta_path.read_text())
+        except Exception as exc:
+            self.fail("saved metadata is not valid JSON: %r" % (exc,))
+        self.assertIsInstance(saved, dict)
+        self.assertEqual(saved["name"], "demo-mcp")
+        self.assertEqual(saved["source"], "npm")
+
+        array_path = self.mcm_home / "registry" / "other-mcp" / "metadata.json"
+        array_path.parent.mkdir(parents=True, exist_ok=True)
+        array_path.write_text("[]")
+        try:
+            engine.save_metadata(self._metadata(engine_mod, "other-mcp"))
+        except Exception as exc:
+            self.fail("save_metadata raised %r for a JSON array" % (exc,))
+        try:
+            array_saved = json.loads(array_path.read_text())
+        except Exception as exc:
+            self.fail("saved metadata is not valid JSON: %r" % (exc,))
+        self.assertIsInstance(array_saved, dict)
+        self.assertEqual(array_saved["name"], "other-mcp")
+
+    def test_save_metadata_keeps_string_and_nameless_entries(self):
+        """source: an index entry that was a string or had no name raised while saving"""
+        engine_mod = load_engine(self.mcm_home)
+        engine = engine_mod.MCMEngine()
+        index_path = self.mcm_home / "registry" / "index.json"
+        index_path.parent.mkdir(parents=True, exist_ok=True)
+        index_path.write_text(
+            json.dumps({"mcps": ["keep-me", {"source": "npm"}]})
+        )
+        try:
+            engine.save_metadata(self._metadata(engine_mod))
+        except Exception as exc:
+            self.fail("save_metadata raised %r" % (exc,))
+        try:
+            saved = json.loads(index_path.read_text())
+        except Exception as exc:
+            self.fail("registry index is not valid JSON: %r" % (exc,))
+        mcps = saved["mcps"]
+        self.assertEqual(mcps[0], "keep-me")
+        self.assertEqual(mcps[1], {"source": "npm"})
+        self.assertEqual(mcps[2]["name"], "demo-mcp")
+
+    def test_wrong_shaped_index_is_reported_and_null_counts_are_zero(self):
+        """source: an index that was a JSON list, or an entry whose tool_count was null, traced back in list, status, and validate"""
+        registry = self.mcm_home / "registry"
+        registry.mkdir(parents=True)
+        index_path = registry / "index.json"
+        env = isolated_env(self.home)
+        engine = str(SRC_DIR / "mcm_engine.py")
+        expected = (
+            "The registry index is not valid JSON: %s. Move it aside and run discover again."
+            % index_path
+        )
+
+        def run_list():
+            return subprocess.run(
+                [sys.executable, engine, "list"],
+                cwd=str(self.tmp),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+
+        def run_script(name):
+            return subprocess.run(
+                ["bash", str(SRC_DIR / "commands" / name)],
+                cwd=str(self.tmp),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+
+        for body in ("[]", json.dumps({"mcps": {"name": "x"}})):
+            index_path.write_text(body)
+            proc = run_list()
+            combined = proc.stdout + proc.stderr
+            self.assertEqual(proc.returncode, 1, combined)
+            self.assertIn(expected, combined)
+            self.assertNotIn("Traceback", combined)
+            for script in ("status.sh", "validate.sh"):
+                proc = run_script(script)
+                combined = proc.stdout + proc.stderr
+                self.assertEqual(proc.returncode, 1, combined)
+                self.assertIn(expected, combined)
+                self.assertNotIn("Traceback", combined)
+
+        index_path.write_text(
+            json.dumps(
+                {
+                    "mcps": [
+                        "skip-me",
+                        {
+                            "name": "counted",
+                            "inspected": True,
+                            "tool_count": None,
+                            "context_tokens": None,
+                            "format": "cli",
+                        },
+                    ]
+                }
+            )
+        )
+        listed = run_list()
+        listed_text = listed.stdout + listed.stderr
+        self.assertEqual(listed.returncode, 0, listed_text)
+        self.assertIn("counted", listed_text)
+        self.assertIn("0 tools", listed_text)
+        self.assertNotIn("Traceback", listed_text)
+        self.assertNotIn("None", listed_text)
+
+        status = run_script("status.sh")
+        status_text = status.stdout + status.stderr
+        self.assertEqual(status.returncode, 0, status_text)
+        self.assertIn("0 tools", status_text)
+        self.assertIn("~0 tokens", status_text)
+        self.assertNotIn("Traceback", status_text)
+        self.assertNotIn("None", status_text)
+
+        validate = run_script("validate.sh")
+        validate_text = validate.stdout + validate.stderr
+        self.assertEqual(validate.returncode, 0, validate_text)
+        self.assertIn("inspected, 0 tools", validate_text)
+        self.assertNotIn("Traceback", validate_text)
+        self.assertNotIn("None", validate_text)
 
 
 if __name__ == "__main__":

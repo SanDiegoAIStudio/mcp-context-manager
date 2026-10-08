@@ -31,6 +31,23 @@ if ! command -v python3 &> /dev/null; then
     echo "  Install from: https://www.python.org/downloads/"
     exit 1
 fi
+
+py_version_line="$(python3 --version 2>&1 || true)"
+py_version="${py_version_line#Python }"
+py_version="${py_version%%[[:space:]]*}"
+py_major="${py_version%%.*}"
+py_rest="${py_version#*.}"
+py_minor="${py_rest%%.*}"
+py_ok=0
+if [[ "$py_major" =~ ^[0-9]+$ && "$py_minor" =~ ^[0-9]+$ ]]; then
+    if [[ "$py_major" -gt 3 || ( "$py_major" -eq 3 && "$py_minor" -ge 9 ) ]]; then
+        py_ok=1
+    fi
+fi
+if [[ "$py_ok" -ne 1 ]]; then
+    echo -e "${RED}✗ Python 3.9 or newer is required (found ${py_version})${NC}"
+    exit 1
+fi
 echo -e "${GREEN}✓ Python 3${NC} ($(python3 --version))"
 
 if ! command -v git &> /dev/null; then
