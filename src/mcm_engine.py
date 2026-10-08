@@ -16,6 +16,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -37,75 +38,6 @@ GITHUB_URL = re.compile(
 GITHUB_REPO = re.compile(
     r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}"
 )
-
-
-def _accept_github_repo(candidate: str) -> Optional[str]:
-    """Keep owner/repo only when it matches GITHUB_REPO and is not a dot path."""
-    text = candidate.strip()
-    text = text.split("?", 1)[0]
-    text = text.strip().strip("/")
-    marker = "/tree/"
-    at = text.find(marker)
-    if at != -1:
-        text = text[:at]
-    elif text.endswith("/tree"):
-        text = text[: -len("/tree")]
-    text = text.strip("/")
-    if text.endswith(".git"):
-        text = text[:-4]
-    text = text.strip("/")
-    if (
-        GITHUB_REPO.fullmatch(text) is None
-        or text.endswith("/.")
-        or text.endswith("/..")
-    ):
-        return None
-    return text
-
-
-def github_repo_from(repository) -> Optional[str]:
-    """Return owner/repo for a GitHub repository field, or None."""
-    if isinstance(repository, dict):
-        raw = repository.get("url")
-    elif isinstance(repository, str):
-        raw = repository
-    else:
-        return None
-    if not isinstance(raw, str):
-        return None
-
-    text = raw.strip()
-    if "#" in text:
-        text = text.split("#", 1)[0].strip()
-    if text == "":
-        return None
-    if text.startswith("github:"):
-        return _accept_github_repo(text[len("github:"):])
-
-    scp = re.fullmatch(r"git@([^:]+):(.+)", text)
-    if scp is not None:
-        host = scp.group(1).lower()
-        if host.startswith("www."):
-            host = host[4:]
-        if host != "github.com":
-            return None
-        return _accept_github_repo(scp.group(2))
-
-    if text.startswith("git+"):
-        text = text[4:]
-    if "://" in text:
-        parsed = urllib.parse.urlsplit(text)
-        host = parsed.hostname
-        if host is None:
-            return None
-        if host.startswith("www."):
-            host = host[4:]
-        if host != "github.com":
-            return None
-        if parsed.scheme not in ("https", "http", "git", "ssh"):
-            return None
-        return _accept_github_repo(parsed.path)
-    return _accept_github_repo(text)
 
 
 def utc_now_iso() -> str:
@@ -215,6 +147,57 @@ def _write_json_atomic(path: Path, payload) -> None:
         except OSError:
             pass
         raise
+
+
+def _metadata_value_empty(value) -> bool:
+    return value == "" or value == []
+
+
+def _saved_metadata_object(path: Path) -> Optional[Dict]:
+    """Return metadata.json when it holds a JSON object, otherwise None."""
+    if not path.is_file():
+        return None
+    try:
+        with open(path) as handle:
+            data = json.load(handle)
+    except (UnicodeDecodeError, ValueError):
+        return None
+    if isinstance(data, dict):
+        return data
+    return None
+
+
+def _merge_metadata_records(new_record: Dict, saved: Dict) -> Dict:
+    """Merge a new record with the metadata.json object saved for the same name."""
+    if new_record.get("inspected"):
+        merged = dict(new_record)
+        for field in (
+            "description",
+            "dependencies",
+            "credentials_needed",
+            "url",
+            "source",
+        ):
+            if _metadata_value_empty(new_record.get(field)) and field in saved:
+                merged[field] = saved[field]
+        if "discovered_at" in saved:
+            merged["discovered_at"] = saved["discovered_at"]
+        return merged
+    if saved.get("inspected"):
+        merged = dict(new_record)
+        for field in (
+            "tools",
+            "tool_count",
+            "complexity_score",
+            "context_cost_estimate",
+            "format",
+            "inspected",
+            "inspected_at",
+        ):
+            if field in saved:
+                merged[field] = saved[field]
+        return merged
+    return dict(new_record)
 
 
 def safe_child(root: Path, name: str) -> Path:
@@ -441,10 +424,17 @@ class MCMEngine:
                 )
                 pkg_status, pkg_text = http_request("GET", package_url)
                 if pkg_status == 200:
-                    package_json = json.loads(pkg_text)
+                    loaded = json.loads(pkg_text)
+                    if isinstance(loaded, dict):
+                        package_json = loaded
                     break
         except Exception:
             package_json = {}
+
+        dependency_names = []
+        raw_dependencies = package_json.get("dependencies")
+        if isinstance(raw_dependencies, dict):
+            dependency_names = list(raw_dependencies.keys())
 
         metadata = MCPMetadata(
             name=repo_name,
@@ -455,7 +445,7 @@ class MCMEngine:
             tool_count=0,
             complexity_score=0.0,
             context_cost_estimate=0,
-            dependencies=list(package_json.get("dependencies", {}).keys()) if package_json else [],
+            dependencies=dependency_names,
             credentials_needed=self.detect_credentials([]),
             discovered_at=utc_now_iso(),
             format="direct"
@@ -474,49 +464,43 @@ class MCMEngine:
             raise http_error("NPM registry error", status, text)
 
         npm_data = json.loads(text)
-        latest_version = npm_data["dist-tags"]["latest"]
-        latest_data = npm_data["versions"][latest_version]
-        package_title = npm_data["name"]
-        if isinstance(package_title, str):
-            package_title = _strip_controls(package_title)
-
-        def npm_only_metadata():
-            return MCPMetadata(
-                name=package_title,
-                source="npm",
-                url=f"https://www.npmjs.com/package/{package_name}",
-                description=_stored_description(latest_data.get("description", "")),
-                tools=[],  # Would need to download and analyze
-                tool_count=0,
-                complexity_score=0.0,
-                context_cost_estimate=0,
-                dependencies=list(latest_data.get("dependencies", {}).keys()),
-                credentials_needed=[],
-                discovered_at=utc_now_iso(),
-                format="direct"
+        latest_version = None
+        versions = None
+        if isinstance(npm_data, dict):
+            dist_tags = npm_data.get("dist-tags")
+            if isinstance(dist_tags, dict):
+                latest_version = dist_tags.get("latest")
+            versions = npm_data.get("versions")
+        if (
+            latest_version is None
+            or not isinstance(versions, dict)
+            or latest_version not in versions
+            or not isinstance(versions.get(latest_version), dict)
+        ):
+            raise Exception(
+                "npm registry answer for %s has no latest version" % package_name
             )
+        latest_data = versions[latest_version]
+        dependencies = latest_data.get("dependencies")
+        if isinstance(dependencies, dict):
+            dependency_names = list(dependencies.keys())
+        else:
+            dependency_names = []
 
-        github_path = github_repo_from(latest_data.get("repository"))
-        if github_path:
-            metadata = None
-            reason = None
-            try:
-                metadata = self.discover_from_github(
-                    {"identifier": github_path, "type": "github_url"}
-                )
-            except Exception as exc:
-                reason = _strip_controls(str(exc))
-            if metadata is None:
-                if reason is None:
-                    reason = "no result"
-                print(
-                    f"  GitHub details unavailable ({reason}); saved npm details only"
-                )
-                return npm_only_metadata()
-            metadata.name = package_name
-            return metadata
-
-        return npm_only_metadata()
+        return MCPMetadata(
+            name=package_name,
+            source="npm",
+            url="https://www.npmjs.com/package/%s" % package_name,
+            description=_stored_description(latest_data.get("description", "")),
+            tools=[],  # Would need to download and analyze
+            tool_count=0,
+            complexity_score=0.0,
+            context_cost_estimate=0,
+            dependencies=dependency_names,
+            credentials_needed=[],
+            discovered_at=utc_now_iso(),
+            format="direct"
+        )
 
     def calculate_complexity(self, tools: List[Dict]) -> float:
         """Calculate complexity score for tools"""
@@ -591,42 +575,36 @@ class MCMEngine:
             mcps = []
         index["mcps"] = mcps
 
-        existing_entry = None
-        for item in mcps:
-            if item.get("name") == metadata.name:
-                existing_entry = item
-                break
+        registry_dir = safe_child(registry_root, metadata.name)
+        metadata_file = registry_dir / "metadata.json"
+        saved = _saved_metadata_object(metadata_file)
+        record = asdict(metadata)
+        if saved is not None:
+            record = _merge_metadata_records(record, saved)
 
-        keep_inspected = (
-            (not metadata.inspected)
-            and existing_entry is not None
-            and bool(existing_entry.get("inspected"))
-        )
+        registry_dir.mkdir(parents=True, exist_ok=True)
+        _write_json_atomic(metadata_file, record)
 
-        if keep_inspected:
-            entry = dict(existing_entry)
-            entry["name"] = metadata.name
-            entry["source"] = metadata.source
-            entry["discovered_at"] = metadata.discovered_at
-        else:
-            registry_dir = safe_child(registry_root, metadata.name)
-            registry_dir.mkdir(parents=True, exist_ok=True)
+        entry = {
+            "name": record["name"],
+            "source": record["source"],
+            "tool_count": record["tool_count"],
+            "format": record["format"],
+            "discovered_at": record["discovered_at"],
+            "inspected": bool(record.get("inspected")),
+        }
+        if record.get("inspected"):
+            entry["context_tokens"] = record["context_cost_estimate"]
 
-            metadata_file = registry_dir / "metadata.json"
-            _write_json_atomic(metadata_file, asdict(metadata))
-
-            entry = {
-                "name": metadata.name,
-                "source": metadata.source,
-                "tool_count": metadata.tool_count,
-                "format": metadata.format,
-                "discovered_at": metadata.discovered_at,
-                "inspected": bool(metadata.inspected),
-            }
-            if metadata.inspected:
-                entry["context_tokens"] = metadata.context_cost_estimate
-
-        existing = [m for m in index["mcps"] if m["name"] != metadata.name]
+        existing = []
+        for item in index["mcps"]:
+            if (
+                isinstance(item, dict)
+                and isinstance(item.get("name"), str)
+                and item.get("name") == metadata.name
+            ):
+                continue
+            existing.append(item)
         existing.append(entry)
 
         index["mcps"] = existing
@@ -641,19 +619,45 @@ class InspectError(Exception):
 
 INSPECT_TIMEOUT = 30
 
-_INSPECT_ENV_KEYS = ("PATH", "HOME", "USER", "LANG", "TMPDIR")
+_INSPECT_ENV_KEYS = (
+    "PATH",
+    "HOME",
+    "USER",
+    "LANG",
+    "TMPDIR",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+    "all_proxy",
+    "NODE_EXTRA_CA_CERTS",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+)
 _MAX_TOOL_PAGES = 20
+_STDERR_TAIL_BYTES = 4096
 
 
 def _strip_controls(text: str) -> str:
     kept = []
     for ch in text:
         code = ord(ch)
-        # Drop C0 controls (including escape), DEL, and the C1 range.
+        # Drop C0 controls (including escape), DEL, the C1 range, and format characters.
         if code < 32 or code == 127 or 0x80 <= code <= 0x9F:
+            continue
+        if unicodedata.category(ch) == "Cf":
             continue
         kept.append(ch)
     return "".join(kept)
+
+
+def _numeric_count(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    return value
 
 
 def _stored_description(value):
@@ -677,7 +681,13 @@ def _inspect_env() -> Dict[str, str]:
 def _read_stderr_tail(path: str) -> str:
     try:
         with open(path, "rb") as handle:
-            data = handle.read()
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            if size > _STDERR_TAIL_BYTES:
+                handle.seek(size - _STDERR_TAIL_BYTES)
+            else:
+                handle.seek(0)
+            data = handle.read(_STDERR_TAIL_BYTES)
     except OSError:
         return ""
     return data.decode("utf-8", errors="replace")
@@ -721,9 +731,13 @@ def _clean_tools(raw_tools: List) -> List[Dict]:
         if not isinstance(entry, dict):
             continue
         name = entry.get("name")
-        if not isinstance(name, str) or name == "":
+        if not isinstance(name, str):
             continue
         name = _strip_controls(name)
+        if name == "":
+            continue
+        if len(name) > 200:
+            name = name[:200]
         description = entry.get("description", "")
         if not isinstance(description, str):
             description = ""
@@ -825,7 +839,7 @@ def _inspect_exchange(
     def timed_out():
         record_note()
         raise InspectError(
-            "the server did not answer within %g seconds; it was stopped%s"
+            "the server did not answer within %g seconds; it was stopped%s. If npx was still downloading the package, run it again."
             % (timeout, non_json_suffix())
         )
 
@@ -876,13 +890,14 @@ def _inspect_exchange(
                 continue
             try:
                 message = json.loads(text)
-            except ValueError:
+            except (ValueError, RecursionError):
                 skipped[0] += 1
                 continue
             if not isinstance(message, dict):
                 skipped[0] += 1
                 continue
-            if message.get("id") != expected_id:
+            msg_id = message.get("id")
+            if isinstance(msg_id, bool) or msg_id != expected_id:
                 continue
             if "method" in message:
                 continue
@@ -944,9 +959,14 @@ def _inspect_exchange(
         raw_tools.extend(result["tools"])
         cursor = result.get("nextCursor")
         if not isinstance(cursor, str):
+            cursor = None
             break
 
     record_note()
+    if notes is not None and isinstance(cursor, str):
+        notes.append(
+            "the server has more than 20 pages of tools; only the first 20 pages were read"
+        )
     return (_clean_tools(raw_tools), _context_tokens(raw_tools))
 
 
@@ -988,7 +1008,11 @@ def _cmd_inspect(engine: "MCMEngine"):
         if not sys.stdin.isatty():
             print("Not started. Run it again with --yes to continue.")
             sys.exit(1)
-        answer = input("Continue? (y/n) ")
+        try:
+            answer = input("Continue? (y/n) ")
+        except EOFError:
+            print("Not started.")
+            sys.exit(1)
         if answer.strip().lower() not in ("y", "yes"):
             print("Not started.")
             sys.exit(1)
@@ -1004,6 +1028,9 @@ def _cmd_inspect(engine: "MCMEngine"):
         )
     except InspectError as exc:
         print(f"Error: {exc}")
+        sys.exit(1)
+    except OSError as exc:
+        print("Error: could not start npx (%s)" % exc)
         sys.exit(1)
 
     now = utc_now_iso()
@@ -1199,10 +1226,19 @@ def main():
             print("No MCPs discovered yet.")
             sys.exit(1)
 
+        invalid_index = False
         try:
             with open(index_file) as f:
                 index = json.load(f)
         except json.JSONDecodeError:
+            invalid_index = True
+            index = None
+        if not invalid_index and (
+            not isinstance(index, dict)
+            or not isinstance(index.get("mcps", []), list)
+        ):
+            invalid_index = True
+        if invalid_index:
             print(
                 "The registry index is not valid JSON: %s. Move it aside and run discover again."
                 % index_file
@@ -1210,8 +1246,6 @@ def main():
             sys.exit(1)
 
         mcps = index.get("mcps", [])
-        if not isinstance(mcps, list):
-            mcps = []
         print(f"\nDiscovered MCPs ({len(mcps)}):\n")
         for mcp in mcps:
             if not isinstance(mcp, dict):
@@ -1219,7 +1253,7 @@ def main():
             name = mcp.get("name", "")
             if isinstance(name, str):
                 name = _strip_controls(name)
-            tool_count = mcp.get("tool_count", 0)
+            tool_count = _numeric_count(mcp.get("tool_count", 0))
             fmt = mcp.get("format", "")
             print(f"  • {name}: {tool_count} tools ({fmt})")
 

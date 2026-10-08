@@ -188,6 +188,62 @@ def serve_stderr_controls():
     raise SystemExit(3)
 
 
+def serve_endless():
+    page = 0
+    while True:
+        msg = read_message()
+        if msg is None:
+            return
+        method = msg.get("method")
+        mid = msg.get("id")
+        if method == "initialize":
+            initialize_result(mid)
+        elif method == "tools/list":
+            page += 1
+            write_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": mid,
+                    "result": {
+                        "tools": [{"name": "page-%d" % page}],
+                        "nextCursor": "more",
+                    },
+                }
+            )
+
+
+def serve_deep():
+    sys.stdout.write("[" * 100000 + "\n")
+    sys.stdout.flush()
+    serve_ok("ok")
+
+
+def serve_bool_id():
+    while True:
+        msg = read_message()
+        if msg is None:
+            return
+        method = msg.get("method")
+        mid = msg.get("id")
+        if method == "initialize":
+            write_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": True,
+                    "error": {"code": -32603, "message": "bool id"},
+                }
+            )
+            initialize_result(mid)
+        elif method == "tools/list":
+            write_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": mid,
+                    "result": {"tools": ok_tools("ok")},
+                }
+            )
+
+
 def serve_same_id_request():
     while True:
         msg = read_message()
@@ -257,6 +313,12 @@ def main():
         serve_stderr_controls()
     elif mode == "same_id":
         serve_same_id_request()
+    elif mode == "endless":
+        serve_endless()
+    elif mode == "deep":
+        serve_deep()
+    elif mode == "bool_id":
+        serve_bool_id()
     elif mode == "stale_id":
         serve_stale_id()
     elif mode == "silent":
