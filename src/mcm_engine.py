@@ -39,6 +39,75 @@ GITHUB_REPO = re.compile(
 )
 
 
+def _accept_github_repo(candidate: str) -> Optional[str]:
+    """Keep owner/repo only when it matches GITHUB_REPO and is not a dot path."""
+    text = candidate.strip()
+    text = text.split("?", 1)[0]
+    text = text.strip().strip("/")
+    marker = "/tree/"
+    at = text.find(marker)
+    if at != -1:
+        text = text[:at]
+    elif text.endswith("/tree"):
+        text = text[: -len("/tree")]
+    text = text.strip("/")
+    if text.endswith(".git"):
+        text = text[:-4]
+    text = text.strip("/")
+    if (
+        GITHUB_REPO.fullmatch(text) is None
+        or text.endswith("/.")
+        or text.endswith("/..")
+    ):
+        return None
+    return text
+
+
+def github_repo_from(repository) -> Optional[str]:
+    """Return owner/repo for a GitHub repository field, or None."""
+    if isinstance(repository, dict):
+        raw = repository.get("url")
+    elif isinstance(repository, str):
+        raw = repository
+    else:
+        return None
+    if not isinstance(raw, str):
+        return None
+
+    text = raw.strip()
+    if "#" in text:
+        text = text.split("#", 1)[0].strip()
+    if text == "":
+        return None
+    if text.startswith("github:"):
+        return _accept_github_repo(text[len("github:"):])
+
+    scp = re.fullmatch(r"git@([^:]+):(.+)", text)
+    if scp is not None:
+        host = scp.group(1).lower()
+        if host.startswith("www."):
+            host = host[4:]
+        if host != "github.com":
+            return None
+        return _accept_github_repo(scp.group(2))
+
+    if text.startswith("git+"):
+        text = text[4:]
+    if "://" in text:
+        parsed = urllib.parse.urlsplit(text)
+        host = parsed.hostname
+        if host is None:
+            return None
+        if host.startswith("www."):
+            host = host[4:]
+        if host != "github.com":
+            return None
+        if parsed.scheme not in ("https", "http", "git", "ssh"):
+            return None
+        return _accept_github_repo(parsed.path)
+    return _accept_github_repo(text)
+
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(tzinfo=None).isoformat() + "Z"
 
@@ -129,6 +198,23 @@ def http_error(label: str, status: int, text: str) -> Exception:
     if 300 <= status <= 399:
         return Exception(f"{label}: {status} (a redirect to another host was refused)")
     return Exception(f"{label}: {status}")
+
+
+def _write_json_atomic(path: Path, payload) -> None:
+    """Write JSON via a temp file in the same folder, then replace the target."""
+    folder = path.parent
+    folder.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=".mcm-tmp-", dir=str(folder))
+    try:
+        with os.fdopen(fd, "w") as handle:
+            json.dump(payload, handle, indent=2)
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 def safe_child(root: Path, name: str) -> Path:
@@ -302,7 +388,11 @@ class MCMEngine:
                 return None
 
         except Exception as e:
-            self.log(f"Discovery failed for {mcp_info['identifier']}: {str(e)}", "error")
+            detail = _strip_controls(str(e))
+            self.log(
+                f"Discovery failed for {mcp_info['identifier']}: {detail}",
+                "error",
+            )
             return None
 
     def discover_from_github(self, mcp_info: Dict) -> Optional[MCPMetadata]:
@@ -330,27 +420,37 @@ class MCMEngine:
             raise http_error("GitHub API error", status, text)
 
         repo_data = json.loads(text)
+        repo_name = repo_data["name"]
+        if isinstance(repo_name, str):
+            repo_name = _strip_controls(repo_name)
 
-        # Extract package.json if exists
+        # Extract package.json if exists. Prefer the repository's default branch.
         print(f"  → raw.githubusercontent.com: {repo_path} package.json")
-        package_url = f"https://raw.githubusercontent.com/{repo_path}/main/package.json"
+        package_json = {}
+        branches = []
+        default_branch = repo_data.get("default_branch")
+        if isinstance(default_branch, str) and default_branch:
+            branches.append(urllib.parse.quote(default_branch, safe="/"))
+        for branch in ("main", "master"):
+            if branch not in branches:
+                branches.append(branch)
         try:
-            pkg_status, pkg_text = http_request("GET", package_url)
-            if pkg_status == 200:
-                package_json = json.loads(pkg_text)
-            else:
-                # Try master branch
-                package_url = f"https://raw.githubusercontent.com/{repo_path}/master/package.json"
+            for branch in branches:
+                package_url = (
+                    f"https://raw.githubusercontent.com/{repo_path}/{branch}/package.json"
+                )
                 pkg_status, pkg_text = http_request("GET", package_url)
-                package_json = json.loads(pkg_text) if pkg_status == 200 else {}
-        except:
+                if pkg_status == 200:
+                    package_json = json.loads(pkg_text)
+                    break
+        except Exception:
             package_json = {}
 
         metadata = MCPMetadata(
-            name=repo_data["name"],
+            name=repo_name,
             source="github",
             url=repo_data["html_url"],
-            description=repo_data.get("description", ""),
+            description=_stored_description(repo_data.get("description", "")),
             tools=[],
             tool_count=0,
             complexity_score=0.0,
@@ -376,41 +476,47 @@ class MCMEngine:
         npm_data = json.loads(text)
         latest_version = npm_data["dist-tags"]["latest"]
         latest_data = npm_data["versions"][latest_version]
+        package_title = npm_data["name"]
+        if isinstance(package_title, str):
+            package_title = _strip_controls(package_title)
 
-        # Get repository URL
-        repo_url = latest_data.get("repository", {}).get("url", "")
-        if repo_url.startswith("git+"):
-            repo_url = repo_url[4:]
-        if repo_url.endswith(".git"):
-            repo_url = repo_url[:-4]
-
-        # If GitHub repo, analyze it
-        if "github.com" in repo_url:
-            github_path = repo_url.split("github.com/")[-1]
-            metadata = self.discover_from_github(
-                {"identifier": github_path, "type": "github_url"}
+        def npm_only_metadata():
+            return MCPMetadata(
+                name=package_title,
+                source="npm",
+                url=f"https://www.npmjs.com/package/{package_name}",
+                description=_stored_description(latest_data.get("description", "")),
+                tools=[],  # Would need to download and analyze
+                tool_count=0,
+                complexity_score=0.0,
+                context_cost_estimate=0,
+                dependencies=list(latest_data.get("dependencies", {}).keys()),
+                credentials_needed=[],
+                discovered_at=utc_now_iso(),
+                format="direct"
             )
-            if metadata is not None:
-                metadata.name = package_name
+
+        github_path = github_repo_from(latest_data.get("repository"))
+        if github_path:
+            metadata = None
+            reason = None
+            try:
+                metadata = self.discover_from_github(
+                    {"identifier": github_path, "type": "github_url"}
+                )
+            except Exception as exc:
+                reason = _strip_controls(str(exc))
+            if metadata is None:
+                if reason is None:
+                    reason = "no result"
+                print(
+                    f"  GitHub details unavailable ({reason}); saved npm details only"
+                )
+                return npm_only_metadata()
+            metadata.name = package_name
             return metadata
 
-        # Otherwise create basic metadata
-        metadata = MCPMetadata(
-            name=npm_data["name"],
-            source="npm",
-            url=f"https://www.npmjs.com/package/{package_name}",
-            description=latest_data.get("description", ""),
-            tools=[],  # Would need to download and analyze
-            tool_count=0,
-            complexity_score=0.0,
-            context_cost_estimate=0,
-            dependencies=list(latest_data.get("dependencies", {}).keys()),
-            credentials_needed=[],
-            discovered_at=utc_now_iso(),
-            format="direct"
-        )
-
-        return metadata
+        return npm_only_metadata()
 
     def calculate_complexity(self, tools: List[Dict]) -> float:
         """Calculate complexity score for tools"""
@@ -470,13 +576,23 @@ class MCMEngine:
         registry_root = self.mcm_home / "registry"
         index_file = registry_root / "index.json"
         if index_file.exists():
-            with open(index_file) as f:
-                index = json.load(f)
+            try:
+                with open(index_file) as f:
+                    index = json.load(f)
+            except json.JSONDecodeError:
+                raise ValueError(
+                    f"the registry index is not valid JSON: {index_file}"
+                )
         else:
             index = {"mcps": [], "updated_at": ""}
 
+        mcps = index.get("mcps", [])
+        if not isinstance(mcps, list):
+            mcps = []
+        index["mcps"] = mcps
+
         existing_entry = None
-        for item in index.get("mcps", []):
+        for item in mcps:
             if item.get("name") == metadata.name:
                 existing_entry = item
                 break
@@ -497,8 +613,7 @@ class MCMEngine:
             registry_dir.mkdir(parents=True, exist_ok=True)
 
             metadata_file = registry_dir / "metadata.json"
-            with open(metadata_file, "w") as f:
-                json.dump(asdict(metadata), f, indent=2)
+            _write_json_atomic(metadata_file, asdict(metadata))
 
             entry = {
                 "name": metadata.name,
@@ -517,8 +632,7 @@ class MCMEngine:
         index["mcps"] = existing
         index["updated_at"] = utc_now_iso()
 
-        with open(index_file, "w") as f:
-            json.dump(index, f, indent=2)
+        _write_json_atomic(index_file, index)
 
 
 class InspectError(Exception):
@@ -535,10 +649,21 @@ def _strip_controls(text: str) -> str:
     kept = []
     for ch in text:
         code = ord(ch)
-        if code < 32 or code == 127:
+        # Drop C0 controls (including escape), DEL, and the C1 range.
+        if code < 32 or code == 127 or 0x80 <= code <= 0x9F:
             continue
         kept.append(ch)
     return "".join(kept)
+
+
+def _stored_description(value):
+    """Registry description safe to save. A null description is an empty string."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        spaced = value.replace("\r", " ").replace("\n", " ").replace("\t", " ")
+        return _strip_controls(spaced)
+    return value
 
 
 def _inspect_env() -> Dict[str, str]:
@@ -602,7 +727,7 @@ def _clean_tools(raw_tools: List) -> List[Dict]:
         description = entry.get("description", "")
         if not isinstance(description, str):
             description = ""
-        description = _strip_controls(description)[:200]
+        description = _stored_description(description)[:200]
         if "inputSchema" not in entry or entry.get("inputSchema") is None:
             schema_size = 0
         else:
@@ -622,7 +747,9 @@ def _clean_tools(raw_tools: List) -> List[Dict]:
 
 
 def inspect_command(
-    command: List[str], timeout: float = INSPECT_TIMEOUT
+    command: List[str],
+    timeout: float = INSPECT_TIMEOUT,
+    notes: Optional[List[str]] = None,
 ) -> Tuple[List[Dict], int]:
     """Start one MCP server and collect its tool names over stdio."""
     work = tempfile.TemporaryDirectory(prefix="mcm-inspect-")
@@ -641,7 +768,7 @@ def inspect_command(
             start_new_session=True,
         )
         try:
-            return _inspect_exchange(proc, stderr_path, timeout)
+            return _inspect_exchange(proc, stderr_path, timeout, notes)
         finally:
             _stop_inspect_process(proc)
             proc = None
@@ -656,8 +783,14 @@ def inspect_command(
         work.cleanup()
 
 
-def _inspect_exchange(proc, stderr_path: str, timeout: float) -> Tuple[List[Dict], int]:
+def _inspect_exchange(
+    proc,
+    stderr_path: str,
+    timeout: float,
+    notes: Optional[List[str]] = None,
+) -> Tuple[List[Dict], int]:
     line_queue = queue.Queue()  # type: queue.Queue
+    skipped = [0]
 
     def reader():
         try:
@@ -675,9 +808,25 @@ def _inspect_exchange(proc, stderr_path: str, timeout: float) -> Tuple[List[Dict
     thread.start()
     deadline = time.monotonic() + timeout
 
+    def non_json_suffix():
+        count = skipped[0]
+        if count > 0:
+            return " (%d line(s) of its output were not JSON-RPC)" % count
+        return ""
+
+    def record_note():
+        count = skipped[0]
+        if notes is not None and count > 0:
+            notes.append(
+                "the server wrote %d line(s) to its output that are not JSON-RPC; they were ignored"
+                % count
+            )
+
     def timed_out():
+        record_note()
         raise InspectError(
-            "the server did not answer within %g seconds; it was stopped" % timeout
+            "the server did not answer within %g seconds; it was stopped%s"
+            % (timeout, non_json_suffix())
         )
 
     def exited():
@@ -692,8 +841,12 @@ def _inspect_exchange(proc, stderr_path: str, timeout: float) -> Tuple[List[Dict
         message = "the server exited before answering (exit code %s)" % code
         err = _read_stderr_tail(stderr_path)
         if err:
-            message += " | " + err[-500:]
-        raise InspectError(message)
+            err = err.replace("\r\n", " | ").replace("\n", " | ").replace("\r", " | ")
+            err = _strip_controls(err)
+            if err:
+                message += " | " + err[-500:]
+        record_note()
+        raise InspectError(message + non_json_suffix())
 
     def send(payload: Dict):
         if time.monotonic() >= deadline:
@@ -724,18 +877,28 @@ def _inspect_exchange(proc, stderr_path: str, timeout: float) -> Tuple[List[Dict
             try:
                 message = json.loads(text)
             except ValueError:
-                raise InspectError("the server wrote a line that is not JSON-RPC")
+                skipped[0] += 1
+                continue
             if not isinstance(message, dict):
+                skipped[0] += 1
                 continue
             if message.get("id") != expected_id:
                 continue
+            if "method" in message:
+                continue
+            if "result" not in message and "error" not in message:
+                continue
             error = message.get("error")
-            if error is not None:
+            if "error" in message and error is not None:
                 if not isinstance(error, dict):
                     error = {}
+                detail = error.get("message", "")
+                if not isinstance(detail, str):
+                    detail = "" if detail is None else str(detail)
+                record_note()
                 raise InspectError(
                     "the server answered %s with an error: %s"
-                    % (method, error.get("message", ""))
+                    % (method, _strip_controls(detail))
                 )
             return message.get("result")
 
@@ -776,12 +939,14 @@ def _inspect_exchange(proc, stderr_path: str, timeout: float) -> Tuple[List[Dict
         result = wait_response(next_id, "tools/list")
         next_id += 1
         if not isinstance(result, dict) or not isinstance(result.get("tools"), list):
+            record_note()
             raise InspectError("the server's tools/list answer has no tools list")
         raw_tools.extend(result["tools"])
         cursor = result.get("nextCursor")
         if not isinstance(cursor, str):
             break
 
+    record_note()
     return (_clean_tools(raw_tools), _context_tokens(raw_tools))
 
 
@@ -831,9 +996,11 @@ def _cmd_inspect(engine: "MCMEngine"):
     print(
         f"Starting npx -y {package} in a temporary folder; it is stopped after {INSPECT_TIMEOUT} seconds."
     )
+    notes = []  # type: List[str]
     try:
         tools, context_tokens = inspect_command(
-            ["npx", "-y", package] + server_args
+            ["npx", "-y", package] + server_args,
+            notes=notes,
         )
     except InspectError as exc:
         print(f"Error: {exc}")
@@ -856,12 +1023,18 @@ def _cmd_inspect(engine: "MCMEngine"):
         inspected=True,
         inspected_at=now,
     )
-    engine.save_metadata(metadata)
+    try:
+        engine.save_metadata(metadata)
+    except (ValueError, OSError) as exc:
+        print(f"Error: {package} was inspected but not saved ({exc})")
+        sys.exit(1)
     print(
         f"{package}: {len(tools)} tools, about {context_tokens} tokens of tool definitions"
     )
     for tool in tools:
         print(f"  - {tool['name']} (schema {tool['schema_size']} characters)")
+    for note in notes:
+        print(f"Note: {note}")
 
 
 def scan_claude_config(project_dir: Path, home: Path) -> Tuple[List[str], List[str]]:
@@ -937,15 +1110,31 @@ def scan_claude_config(project_dir: Path, home: Path) -> Tuple[List[str], List[s
     return (packages, skipped)
 
 
+def _engine_usage():
+    return (
+        "Usage: mcm_engine.py <command> [args]\n"
+        "\n"
+        "Commands:\n"
+        "  discover <file>    Discover MCPs named in a file\n"
+        "  inspect <package>  Start a server and list its tools\n"
+        "  scan-config        Read MCP package names from Claude config\n"
+        "  list               List discovered MCPs"
+    )
+
+
 def main():
     """Main entry point"""
-    engine = MCMEngine()
-
-    if len(sys.argv) < 2:
-        print("Usage: mcm_engine.py <command> [args]")
-        sys.exit(1)
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+        print(_engine_usage())
+        sys.exit(0)
 
     command = sys.argv[1]
+    if command not in ("discover", "inspect", "scan-config", "list"):
+        print("Error: unknown command %s" % command)
+        print(_engine_usage())
+        sys.exit(1)
+
+    engine = MCMEngine()
 
     if command == "discover":
         if len(sys.argv) < 3:
@@ -953,8 +1142,12 @@ def main():
             sys.exit(1)
 
         mcp_list_file = sys.argv[2]
-        with open(mcp_list_file) as f:
-            mcp_text = f.read()
+        try:
+            with open(mcp_list_file) as f:
+                mcp_text = f.read()
+        except OSError:
+            print("Error: cannot read %s" % mcp_list_file)
+            sys.exit(1)
 
         mcps = engine.parse_mcp_input(mcp_text)
         print(f"Found {len(mcps)} MCPs to discover\n")
@@ -987,8 +1180,8 @@ def main():
             time.sleep(1)  # Rate limiting
 
         print(f"Discovered {ok} of {len(mcps)}")
-        if len(mcps) > 0 and ok == 0:
-            sys.exit(1)
+        if len(mcps) > 0 and ok < len(mcps):
+            sys.exit(1 if ok == 0 else 2)
 
     elif command == "inspect":
         _cmd_inspect(engine)
@@ -1003,15 +1196,32 @@ def main():
     elif command == "list":
         index_file = engine.mcm_home / "registry" / "index.json"
         if not index_file.exists():
-            print("No MCPs discovered yet. Run 'mcm discover' first.")
+            print("No MCPs discovered yet.")
             sys.exit(1)
 
-        with open(index_file) as f:
-            index = json.load(f)
+        try:
+            with open(index_file) as f:
+                index = json.load(f)
+        except json.JSONDecodeError:
+            print(
+                "The registry index is not valid JSON: %s. Move it aside and run discover again."
+                % index_file
+            )
+            sys.exit(1)
 
-        print(f"\nDiscovered MCPs ({len(index['mcps'])}):\n")
-        for mcp in index["mcps"]:
-            print(f"  • {mcp['name']}: {mcp['tool_count']} tools ({mcp['format']})")
+        mcps = index.get("mcps", [])
+        if not isinstance(mcps, list):
+            mcps = []
+        print(f"\nDiscovered MCPs ({len(mcps)}):\n")
+        for mcp in mcps:
+            if not isinstance(mcp, dict):
+                continue
+            name = mcp.get("name", "")
+            if isinstance(name, str):
+                name = _strip_controls(name)
+            tool_count = mcp.get("tool_count", 0)
+            fmt = mcp.get("format", "")
+            print(f"  • {name}: {tool_count} tools ({fmt})")
 
 if __name__ == "__main__":
     main()

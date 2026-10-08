@@ -6,7 +6,33 @@
 set -euo pipefail
 
 MCM_HOME="${MCM_HOME:-$HOME/.mcm}"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Follow symbolic links so sibling scripts resolve next to this file.
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+    LINK_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+    TARGET="$(readlink "$SOURCE")"
+    case "$TARGET" in
+        /*)
+            SOURCE="$TARGET"
+            ;;
+        *)
+            SOURCE="$LINK_DIR/$TARGET"
+            ;;
+    esac
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+THIS_SCRIPT="$SCRIPT_DIR/$(basename "$SOURCE")"
+
+# Installed copies keep the engine beside this script. A clone keeps it in src/.
+if [[ -f "$SCRIPT_DIR/mcm_engine.py" ]]; then
+    MCM_ENGINE="$SCRIPT_DIR/mcm_engine.py"
+elif [[ -f "$SCRIPT_DIR/../mcm_engine.py" ]]; then
+    MCM_ENGINE="$SCRIPT_DIR/../mcm_engine.py"
+else
+    printf 'Error: mcm_engine.py was not found next to %s or one folder up.\n' "$THIS_SCRIPT" >&2
+    exit 1
+fi
 
 # Colors for output
 RED=$'\033[0;31m'
@@ -41,64 +67,13 @@ heading() {
     echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 }
 
-# Initialize MCM directory structure
-init_mcm() {
-    mkdir -p "$MCM_HOME"/{config,registry,converted,embeddings,analytics,cache,backups,logs}
-    mkdir -p "$MCM_HOME"/converted/skills
-
-    # Create default config if doesn't exist
-    if [[ ! -f "$MCM_HOME/config/mcm-config.json" ]]; then
-        cat > "$MCM_HOME/config/mcm-config.json" <<EOF
-{
-  "version": "1.0.0",
-  "strategy": "balanced",
-  "confidence_threshold": 0.7,
-  "max_tool_budget_percent": 40,
-  "auto_unload_after_messages": 3,
-  "pinned_mcps": [],
-  "created_at": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
-  "updated_at": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-}
-EOF
-    fi
-
-    # Create preferences file
-    if [[ ! -f "$MCM_HOME/config/preferences.json" ]]; then
-        cat > "$MCM_HOME/config/preferences.json" <<EOF
-{
-  "analytics_enabled": true,
-  "auto_optimize": true,
-  "learning_enabled": true,
-  "verbose_logging": false
-}
-EOF
-    fi
-
-    # Create credentials template
-    if [[ ! -f "$MCM_HOME/config/credentials.env" ]]; then
-        cat > "$MCM_HOME/config/credentials.env" <<EOF
-# MCP Context Manager - Credentials
-# Fill in your API keys and tokens below
-
-# GitHub (for GitHub MCP)
-# Get token from: https://github.com/settings/tokens
-# Needs scopes: repo, read:org
-GITHUB_TOKEN=
-
-# Add MCP-specific credentials below:
-# Format: KEY=value (no spaces around =)
-
-EOF
-    fi
-}
-
 # Route commands
 case "${1:-help}" in
     discover)
         exec "$SCRIPT_DIR/discover.sh" "${@:2}"
         ;;
     inspect)
-        exec python3 "$SCRIPT_DIR/mcm_engine.py" inspect "${@:2}"
+        exec python3 "$MCM_ENGINE" inspect "${@:2}"
         ;;
     status)
         exec "$SCRIPT_DIR/status.sh" "${@:2}"
@@ -106,7 +81,7 @@ case "${1:-help}" in
     validate)
         exec "$SCRIPT_DIR/validate.sh" "${@:2}"
         ;;
-    help)
+    -h|--help|help)
         cat <<EOF
 ${BOLD}MCP Context Manager (MCM)${NC}
 

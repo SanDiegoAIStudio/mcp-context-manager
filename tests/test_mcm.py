@@ -215,6 +215,122 @@ class InstallScriptTests(IsolatedHomeTest):
         self.assertNotIn("\\033", combined)
         self.assertIn("Next steps:", combined)
 
+    def test_install_does_not_copy_second_installer(self):
+        """source: review: the root installer copied a legacy second installer"""
+        env = isolated_env(self.home)
+        proc = subprocess.run(
+            ["bash", str(REPO_ROOT / "install.sh")],
+            cwd=str(REPO_ROOT),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(
+            proc.returncode,
+            0,
+            "install.sh failed:\n%s\n%s" % (proc.stdout, proc.stderr),
+        )
+        scripts = Path(self.home) / ".claude" / "scripts" / "mcm"
+        self.assertTrue((scripts / "main.sh").is_file())
+        self.assertFalse((scripts / "install.sh").exists())
+
+    def test_install_creates_no_credentials_file(self):
+        """source: review: the installer created a world-readable token file that nothing reads"""
+        env = isolated_env(self.home)
+        proc = subprocess.run(
+            ["bash", str(REPO_ROOT / "install.sh")],
+            cwd=str(REPO_ROOT),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        combined = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 0, combined)
+        self.assertNotIn("credentials", combined)
+        token_file = "credentials" + ".env"
+        found = []
+        if self.mcm_home.exists():
+            for dirpath, _dirnames, filenames in os.walk(str(self.mcm_home)):
+                for filename in filenames:
+                    if filename == token_file:
+                        found.append(os.path.join(dirpath, filename))
+        self.assertEqual(found, [])
+
+    def test_repository_text_omits_credentials_file_name(self):
+        """source: review: the installer created a world-readable token file that nothing reads"""
+        needle = "credentials" + ".env"
+        offenders = []
+        for dirpath, dirnames, filenames in os.walk(str(REPO_ROOT)):
+            dirnames[:] = [name for name in dirnames if name != ".git"]
+            for filename in filenames:
+                path = os.path.join(dirpath, filename)
+                try:
+                    with open(path, "rb") as handle:
+                        data = handle.read()
+                except OSError:
+                    continue
+                if b"\0" in data:
+                    continue
+                try:
+                    text = data.decode("utf-8")
+                except UnicodeDecodeError:
+                    continue
+                if needle in text:
+                    offenders.append(path)
+        self.assertEqual(offenders, [])
+
+    def test_install_example_list_uses_real_package_names(self):
+        """source: the example list named a missing npm package, deprecated packages, and plain names discover looks up as unrelated packages"""
+        env = isolated_env(self.home)
+        proc = subprocess.run(
+            ["bash", str(REPO_ROOT / "install.sh")],
+            cwd=str(REPO_ROOT),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(
+            proc.returncode,
+            0,
+            "install.sh failed:\n%s\n%s" % (proc.stdout, proc.stderr),
+        )
+        example = (self.mcm_home / "cache" / "mcp-list-example.txt").read_text()
+        self.assertNotIn("server-playwright", example)
+        self.assertNotIn("server-slack", example)
+        lines = example.splitlines()
+        self.assertNotIn("github", lines)
+        self.assertNotIn("postgres", lines)
+        self.assertNotIn("filesystem", lines)
+        self.assertIn("@modelcontextprotocol/server-filesystem", example)
+        self.assertIn("@modelcontextprotocol/server-memory", example)
+        self.assertIn("@playwright/mcp", example)
+        engine_mod = load_engine(self.mcm_home)
+        engine = engine_mod.MCMEngine()
+        checked = 0
+        for line in lines:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            parsed = engine.parse_mcp_input(stripped + "\n")
+            self.assertEqual(len(parsed), 1, line)
+            self.assertNotEqual(parsed[0]["type"], "invalid", line)
+            checked += 1
+        self.assertGreater(checked, 0)
+        self.assertIn(
+            "3. Wait for discovery to finish (a few seconds per name)",
+            proc.stdout,
+        )
+
+    def test_readme_drops_any_format_search_and_long_dash(self):
+        """source: the README said discover takes any format and that you can search and compare"""
+        text = (REPO_ROOT / "README.md").read_text()
+        self.assertNotIn("(any format)", text)
+        self.assertNotIn("search, review, and compare", text)
+        self.assertNotIn("\u2014", text)
+
 
 class ParseMcpInputTests(IsolatedHomeTest):
     def test_parse_mcp_input_skips_comments_and_classifies_names(self):
@@ -622,6 +738,307 @@ class NpmDiscoverTests(IsolatedHomeTest):
             buf.getvalue(),
         )
 
+    def test_github_repo_from_known_forms_and_rejections(self):
+        """source: review: a string repository or an ssh address was not turned into owner/repo"""
+        engine_mod = load_engine(self.mcm_home)
+        forms = [
+            "https://github.com/owner/repo",
+            "https://github.com/owner/repo.git",
+            "https://github.com/owner/repo/",
+            "https://github.com/owner/repo.git/",
+            "https://github.com/owner/repo#fragment",
+            "https://github.com/owner/repo/tree/main",
+            "https://github.com/owner/repo/tree/main/src",
+            "git+https://github.com/owner/repo.git",
+            "git://github.com/owner/repo.git",
+            "git@github.com:owner/repo.git",
+            "ssh://git@github.com/owner/repo.git",
+            "github:owner/repo",
+            "owner/repo",
+            {"url": "https://github.com/owner/repo.git"},
+            {"type": "git", "url": "git+https://github.com/owner/repo.git"},
+        ]
+        for form in forms:
+            self.assertEqual(
+                engine_mod.github_repo_from(form),
+                "owner/repo",
+                form,
+            )
+        for form in (
+            "https://gitlab.com/owner/repo",
+            "git@example.test:owner/repo.git",
+            "owner/../x",
+            None,
+            42,
+        ):
+            self.assertIsNone(engine_mod.github_repo_from(form), form)
+
+    def test_discover_from_npm_string_repository_asks_github(self):
+        """source: review: an npm repository string raised AttributeError"""
+        engine_mod = load_engine(self.mcm_home)
+        npm_doc = {
+            "name": "string-repo",
+            "dist-tags": {"latest": "1.0.0"},
+            "versions": {
+                "1.0.0": {
+                    "description": "from npm",
+                    "repository": "github:owner/repo",
+                }
+            },
+        }
+        recorded = []
+
+        def fake_http(method, url, headers=None, json_body=None, timeout=30):
+            recorded.append(url)
+            if "registry.npmjs.org" in url:
+                return (200, json.dumps(npm_doc))
+            if url == "https://api.github.com/repos/owner/repo":
+                return (
+                    200,
+                    json.dumps(
+                        {
+                            "name": "repo",
+                            "html_url": "https://github.com/owner/repo",
+                            "description": "from github",
+                            "default_branch": "main",
+                        }
+                    ),
+                )
+            return (404, "")
+
+        engine = engine_mod.MCMEngine()
+        with patch.object(engine_mod, "http_request", side_effect=fake_http):
+            metadata = engine.discover_from_npm(
+                {"identifier": "string-repo", "type": "npm_package"}
+            )
+        self.assertIn("https://api.github.com/repos/owner/repo", recorded)
+        self.assertEqual(metadata.name, "string-repo")
+
+    def test_discover_from_npm_keeps_npm_details_when_github_fails(self):
+        """source: review: a failed GitHub lookup discarded the npm details already fetched"""
+        engine_mod = load_engine(self.mcm_home)
+        npm_doc = {
+            "name": "blocked-mcp",
+            "dist-tags": {"latest": "1.0.0"},
+            "versions": {
+                "1.0.0": {
+                    "description": "Saved anyway",
+                    "repository": {"url": "https://github.com/owner/repo"},
+                    "dependencies": {"left-pad": "1.0.0"},
+                }
+            },
+        }
+
+        def fake_http(method, url, headers=None, json_body=None, timeout=30):
+            if "registry.npmjs.org" in url:
+                return (200, json.dumps(npm_doc))
+            if "api.github.com" in url:
+                return (403, "")
+            return (404, "")
+
+        engine = engine_mod.MCMEngine()
+        buf = io.StringIO()
+        try:
+            with patch.object(engine_mod, "http_request", side_effect=fake_http):
+                with contextlib.redirect_stdout(buf):
+                    metadata = engine.discover_from_npm(
+                        {"identifier": "blocked-mcp", "type": "npm_package"}
+                    )
+        except Exception as exc:
+            self.fail(
+                "a failed GitHub lookup aborted npm discovery: %s" % exc
+            )
+        self.assertIsNotNone(metadata)
+        self.assertEqual(metadata.name, "blocked-mcp")
+        self.assertEqual(metadata.source, "npm")
+        self.assertEqual(metadata.description, "Saved anyway")
+        self.assertEqual(metadata.dependencies, ["left-pad"])
+        self.assertEqual(
+            metadata.url, "https://www.npmjs.com/package/blocked-mcp"
+        )
+        self.assertIn("GitHub details unavailable", buf.getvalue())
+
+    def test_discover_from_github_reads_default_branch_package_json(self):
+        """source: review: package.json was read from main before the repository default branch"""
+        engine_mod = load_engine(self.mcm_home)
+        recorded = []
+
+        def fake_http(method, url, headers=None, json_body=None, timeout=30):
+            recorded.append(url)
+            if "api.github.com" in url:
+                return (
+                    200,
+                    json.dumps(
+                        {
+                            "name": "repo",
+                            "html_url": "https://github.com/owner/repo",
+                            "description": "d",
+                            "default_branch": "trunk",
+                        }
+                    ),
+                )
+            return (404, "")
+
+        engine = engine_mod.MCMEngine()
+        with patch.object(engine_mod, "http_request", side_effect=fake_http):
+            engine.discover_from_github(
+                {"identifier": "owner/repo", "type": "github_url"}
+            )
+        pkg_urls = [url for url in recorded if url.endswith("/package.json")]
+        trunk = "https://raw.githubusercontent.com/owner/repo/trunk/package.json"
+        main = "https://raw.githubusercontent.com/owner/repo/main/package.json"
+        master = "https://raw.githubusercontent.com/owner/repo/master/package.json"
+        self.assertIn(trunk, pkg_urls)
+        self.assertLess(pkg_urls.index(trunk), pkg_urls.index(main))
+        self.assertLess(pkg_urls.index(trunk), pkg_urls.index(master))
+
+    def test_default_branch_is_quoted_in_the_raw_address(self):
+        """source: a default_branch with a space or hash was placed raw in the package.json address"""
+        engine_mod = load_engine(self.mcm_home)
+        recorded = []
+
+        def fake_http(method, url, headers=None, json_body=None, timeout=30):
+            recorded.append(url)
+            if "api.github.com" in url:
+                return (
+                    200,
+                    json.dumps(
+                        {
+                            "name": "repo",
+                            "html_url": "https://github.com/owner/repo",
+                            "description": "d",
+                            "default_branch": "release/1.0 #x",
+                        }
+                    ),
+                )
+            return (404, "")
+
+        engine = engine_mod.MCMEngine()
+        with patch.object(engine_mod, "http_request", side_effect=fake_http):
+            engine.discover_from_github(
+                {"identifier": "owner/repo", "type": "github_url"}
+            )
+        expected = (
+            "https://raw.githubusercontent.com/owner/repo/"
+            "release/1.0%20%23x/package.json"
+        )
+        self.assertIn(expected, recorded)
+
+    def test_github_null_description_is_saved_as_empty_string(self):
+        """source: review: a null GitHub description was saved as None"""
+        engine_mod = load_engine(self.mcm_home)
+
+        def fake_http(method, url, headers=None, json_body=None, timeout=30):
+            if "api.github.com" in url:
+                return (
+                    200,
+                    json.dumps(
+                        {
+                            "name": "repo",
+                            "html_url": "https://github.com/owner/repo",
+                            "description": None,
+                        }
+                    ),
+                )
+            return (404, "")
+
+        engine = engine_mod.MCMEngine()
+        with patch.object(engine_mod, "http_request", side_effect=fake_http):
+            metadata = engine.discover_from_github(
+                {"identifier": "owner/repo", "type": "github_url"}
+            )
+        self.assertIsInstance(metadata.description, str)
+        self.assertEqual(metadata.description, "")
+        engine.save_metadata(metadata)
+        saved = json.loads(
+            (self.mcm_home / "registry" / "repo" / "metadata.json").read_text()
+        )
+        self.assertEqual(saved["description"], "")
+
+    def test_registry_descriptions_drop_control_characters(self):
+        """source: review: GitHub and npm descriptions were saved with terminal control characters"""
+        engine_mod = load_engine(self.mcm_home)
+        hostile = "hello\u001b[31m\u009b"
+        npm_doc = {
+            "name": "demo-mcp",
+            "dist-tags": {"latest": "1.0.0"},
+            "versions": {
+                "1.0.0": {
+                    "description": hostile,
+                    "repository": {"url": "git+https://gitlab.com/example/demo-mcp.git"},
+                }
+            },
+        }
+
+        def fake_npm(method, url, headers=None, json_body=None, timeout=30):
+            return (200, json.dumps(npm_doc))
+
+        engine = engine_mod.MCMEngine()
+        with patch.object(engine_mod, "http_request", side_effect=fake_npm):
+            npm_meta = engine.discover_from_npm(
+                {"identifier": "demo-mcp", "type": "npm_package"}
+            )
+        self.assertEqual(npm_meta.description, "hello[31m")
+
+        def fake_github(method, url, headers=None, json_body=None, timeout=30):
+            if "api.github.com" in url:
+                return (
+                    200,
+                    json.dumps(
+                        {
+                            "name": "repo",
+                            "html_url": "https://github.com/owner/repo",
+                            "description": hostile,
+                        }
+                    ),
+                )
+            return (404, "")
+
+        with patch.object(engine_mod, "http_request", side_effect=fake_github):
+            github_meta = engine.discover_from_github(
+                {"identifier": "owner/repo", "type": "github_url"}
+            )
+        self.assertEqual(github_meta.description, "hello[31m")
+        for ch in github_meta.description + npm_meta.description:
+            self.assertGreaterEqual(ord(ch), 32)
+            self.assertFalse(0x80 <= ord(ch) <= 0x9F)
+
+    def test_descriptions_keep_a_space_for_newline_and_tab(self):
+        """source: a newline or tab in a description was deleted when control characters were stripped"""
+        engine_mod = load_engine(self.mcm_home)
+
+        def fake_http(method, url, headers=None, json_body=None, timeout=30):
+            if "api.github.com" in url:
+                return (
+                    200,
+                    json.dumps(
+                        {
+                            "name": "repo",
+                            "html_url": "https://github.com/owner/repo",
+                            "description": "first line\nsecond\tline",
+                        }
+                    ),
+                )
+            return (404, "")
+
+        engine = engine_mod.MCMEngine()
+        with patch.object(engine_mod, "http_request", side_effect=fake_http):
+            metadata = engine.discover_from_github(
+                {"identifier": "owner/repo", "type": "github_url"}
+            )
+        self.assertEqual(metadata.description, "first line second line")
+        engine.save_metadata(metadata)
+        saved = json.loads(
+            (self.mcm_home / "registry" / "repo" / "metadata.json").read_text()
+        )
+        self.assertEqual(saved["description"], "first line second line")
+        tools, _tokens = engine_mod.inspect_command(
+            [sys.executable, FAKE, "spacing"], timeout=10
+        )
+        self.assertEqual(tools[0]["description"], "first second")
+        self.assertIn(" ", tools[0]["description"])
+        self.assertNotIn("\n", tools[0]["description"])
+
 
 class InputSafetyTests(IsolatedHomeTest):
     def test_invalid_entry_sends_nothing(self):
@@ -720,6 +1137,61 @@ class EngineMainTests(IsolatedHomeTest):
         self.assertEqual(ctx.exception.code, 1)
         self.assertIn("Discovered 0 of 1", buf.getvalue())
 
+    def test_discover_exit_codes_for_partial_and_empty_lists(self):
+        """source: discover exited 0 when some names failed, so the script said discovery was complete"""
+        engine_mod = load_engine(self.mcm_home)
+
+        def meta(name):
+            return engine_mod.MCPMetadata(
+                name=name,
+                source="npm",
+                url="http://example.test",
+                description="",
+                tools=[],
+                tool_count=0,
+                complexity_score=0.0,
+                context_cost_estimate=0,
+                dependencies=[],
+                credentials_needed=[],
+                discovered_at="2020-01-01T00:00:00Z",
+                format="direct",
+            )
+
+        def run(text, results):
+            list_file = self.tmp / "exit-codes.txt"
+            list_file.write_text(text)
+            with patch.object(
+                engine_mod.MCMEngine, "discover_mcp", side_effect=results
+            ), patch.object(engine_mod.time, "sleep"), patch.object(
+                engine_mod.sys,
+                "argv",
+                ["mcm_engine.py", "discover", str(list_file)],
+            ):
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    try:
+                        engine_mod.main()
+                        code = 0
+                    except SystemExit as exc:
+                        code = exc.code
+            return code, buf.getvalue()
+
+        code, out = run("alpha-mcp\nbeta-mcp\n", [meta("alpha-mcp"), meta("beta-mcp")])
+        self.assertEqual(code, 0)
+        self.assertIn("Discovered 2 of 2", out)
+
+        code, out = run("alpha-mcp\nbeta-mcp\n", [meta("alpha-mcp"), None])
+        self.assertEqual(code, 2)
+        self.assertIn("Discovered 1 of 2", out)
+
+        code, out = run("alpha-mcp\nbeta-mcp\n", [None, None])
+        self.assertEqual(code, 1)
+        self.assertIn("Discovered 0 of 2", out)
+
+        code, out = run("", [])
+        self.assertEqual(code, 0)
+        self.assertIn("Discovered 0 of 0", out)
+
     def test_discover_continues_when_save_refuses_a_name(self):
         """source: push review of 5034ea7: a refused registry name aborted the whole run"""
         engine_mod = load_engine(self.mcm_home)
@@ -771,7 +1243,7 @@ class EngineMainTests(IsolatedHomeTest):
                     code = exc.code
                 except (ValueError, OSError) as exc:
                     self.fail("a refused registry name escaped main: %r" % (exc,))
-        self.assertEqual(code, 0)
+        self.assertEqual(code, 2)
         out = buf.getvalue()
         self.assertIn("../escape: not saved", out)
         self.assertIn("Discovered 1 of 2", out)
@@ -805,6 +1277,97 @@ class EngineMainTests(IsolatedHomeTest):
         self.assertNotIn("DeprecationWarning", combined)
         self.assertNotIn("Traceback", combined)
         self.assertIn("Discovered 0 of 1", combined)
+
+    def test_engine_cli_usage_unknown_command_and_list(self):
+        """source: review: an unknown command printed nothing, a missing list file traced back, and list assumed keys"""
+        engine = str(SRC_DIR / "mcm_engine.py")
+        env = isolated_env(self.home)
+
+        def run(args):
+            return subprocess.run(
+                [sys.executable, engine] + args,
+                cwd=str(self.tmp),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+
+        for args in ([], ["--help"], ["-h"]):
+            proc = run(args)
+            combined = proc.stdout + proc.stderr
+            self.assertEqual(proc.returncode, 0, combined)
+            for word in ("discover", "inspect", "scan-config", "list"):
+                self.assertIn(word, combined)
+
+        bogus = run(["bogus"])
+        bogus_text = bogus.stdout + bogus.stderr
+        self.assertEqual(bogus.returncode, 1, bogus_text)
+        self.assertIn("unknown command bogus", bogus_text)
+        self.assertIn("discover", bogus_text)
+        self.assertNotIn("Traceback", bogus_text)
+
+        missing = self.tmp / "missing-mcp-list.txt"
+        discover = run(["discover", str(missing)])
+        discover_text = discover.stdout + discover.stderr
+        self.assertEqual(discover.returncode, 1, discover_text)
+        self.assertIn("cannot read", discover_text)
+        self.assertIn(str(missing), discover_text)
+        self.assertNotIn("Traceback", discover_text)
+
+        blocked = self.tmp / "unreadable-mcp-list.txt"
+        blocked.write_text("../not-a-package\n")
+        os.chmod(str(blocked), 0)
+        try:
+            if os.geteuid() != 0 and not os.access(str(blocked), os.R_OK):
+                denied = run(["discover", str(blocked)])
+                denied_text = denied.stdout + denied.stderr
+                self.assertEqual(denied.returncode, 1, denied_text)
+                self.assertIn("cannot read", denied_text)
+                self.assertNotIn("Traceback", denied_text)
+        finally:
+            os.chmod(str(blocked), 0o644)
+
+        empty = run(["list"])
+        empty_text = empty.stdout + empty.stderr
+        self.assertIn("No MCPs discovered yet.", empty_text)
+        self.assertNotIn("mcm discover", empty_text)
+        self.assertNotIn("Traceback", empty_text)
+
+        registry = self.mcm_home / "registry"
+        registry.mkdir(parents=True, exist_ok=True)
+        (registry / "index.json").write_text(
+            json.dumps({"mcps": [{"name": "partial"}]})
+        )
+        listed = run(["list"])
+        listed_text = listed.stdout + listed.stderr
+        self.assertEqual(listed.returncode, 0, listed_text)
+        self.assertIn("partial", listed_text)
+        self.assertNotIn("Traceback", listed_text)
+
+    def test_list_corrupt_index_is_reported_without_traceback(self):
+        """source: mcm list printed a traceback when the registry index was not valid JSON"""
+        registry = self.mcm_home / "registry"
+        registry.mkdir(parents=True)
+        index_path = registry / "index.json"
+        index_path.write_text("{not json")
+        env = isolated_env(self.home)
+        proc = subprocess.run(
+            [sys.executable, str(SRC_DIR / "mcm_engine.py"), "list"],
+            cwd=str(self.tmp),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        combined = proc.stdout + proc.stderr
+        expected = (
+            "The registry index is not valid JSON: %s. Move it aside and run discover again."
+            % index_path
+        )
+        self.assertEqual(proc.returncode, 1, combined)
+        self.assertIn(expected, combined)
+        self.assertNotIn("Traceback", combined)
 
 
 class ScanConfigTests(IsolatedHomeTest):
@@ -1033,6 +1596,115 @@ class DiscoverScriptTests(IsolatedHomeTest):
         leftovers = list(cache.glob("mcp-input-*.txt"))
         self.assertEqual(leftovers, [])
 
+    def test_discover_sh_reports_partial_failure_and_complete(self):
+        """source: discover.sh said discovery was complete when some names failed"""
+        scripts = install_copy(self.home)
+        stub_path = scripts / "mcm_engine.py"
+        env = isolated_env(self.home)
+        cache = Path(self.home) / ".mcm" / "cache"
+
+        stub_path.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            "sys.exit(2)\n"
+        )
+        partial = subprocess.run(
+            ["bash", str(scripts / "discover.sh"), "alpha"],
+            cwd=str(self.tmp),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        partial_text = partial.stdout + partial.stderr
+        self.assertEqual(partial.returncode, 2, partial_text)
+        self.assertIn("Discovery finished with failures", partial_text)
+        self.assertIn("Next steps:", partial_text)
+        self.assertIn("1. Review: cat ", partial_text)
+        self.assertIn("2. Validate: mcm validate", partial_text)
+        self.assertNotIn("Discovery complete", partial_text)
+        self.assertEqual(list(cache.glob("mcp-input-*.txt")), [])
+
+        stub_path.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            "sys.exit(0)\n"
+        )
+        done = subprocess.run(
+            ["bash", str(scripts / "discover.sh"), "alpha"],
+            cwd=str(self.tmp),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        done_text = done.stdout + done.stderr
+        self.assertEqual(done.returncode, 0, done_text)
+        self.assertIn("Discovery complete", done_text)
+        self.assertEqual(list(cache.glob("mcp-input-*.txt")), [])
+
+    def test_discover_sh_removes_temp_input_on_every_exit(self):
+        """source: review: discover.sh left its temporary input file behind on some exits"""
+        env = isolated_env(self.home)
+        discover = str(SRC_DIR / "commands" / "discover.sh")
+        cache = self.mcm_home / "cache"
+
+        def leftovers():
+            if not cache.exists():
+                return []
+            return list(cache.glob("mcp-input-*"))
+
+        failed = subprocess.run(
+            ["bash", discover, "../not-a-package"],
+            cwd=str(self.tmp),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        failed_text = failed.stdout + failed.stderr
+        self.assertEqual(failed.returncode, 1, failed_text)
+        self.assertIn("Discovery failed", failed_text)
+        self.assertNotIn("was not found", failed_text)
+        self.assertNotIn("No such file", failed_text)
+        self.assertEqual(leftovers(), [])
+
+        empty = subprocess.run(
+            ["bash", discover],
+            cwd=str(self.tmp),
+            env=env,
+            input="",
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        empty_text = empty.stdout + empty.stderr
+        self.assertEqual(empty.returncode, 1, empty_text)
+        self.assertIn("No MCP names given", empty_text)
+        self.assertEqual(leftovers(), [])
+
+        stub_dir = self.tmp / "stub-layout"
+        stub_dir.mkdir()
+        shutil.copy(
+            str(SRC_DIR / "commands" / "discover.sh"),
+            str(stub_dir / "discover.sh"),
+        )
+        (stub_dir / "mcm_engine.py").write_text(
+            "#!/usr/bin/env python3\nimport sys\nsys.exit(1)\n"
+        )
+        stub = subprocess.run(
+            ["bash", str(stub_dir / "discover.sh"), "alpha"],
+            cwd=str(self.tmp),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        stub_text = stub.stdout + stub.stderr
+        self.assertEqual(stub.returncode, 1, stub_text)
+        self.assertIn("Discovery failed", stub_text)
+        self.assertEqual(leftovers(), [])
+
 
 class MainScriptTests(IsolatedHomeTest):
     def test_main_sh_search_is_unknown_and_help_omits_search(self):
@@ -1078,6 +1750,97 @@ class MainScriptTests(IsolatedHomeTest):
         combined = proc.stdout + proc.stderr
         self.assertNotIn("\\033", combined)
         self.assertIn("Commands:", combined)
+
+    def test_main_through_symlink_runs_help_and_status(self):
+        """source: review: a symlink to main.sh left SCRIPT_DIR unresolved, so commands could not find sibling scripts"""
+        scripts = install_copy(self.home)
+        link_dir = self.tmp / "elsewhere"
+        link_dir.mkdir()
+        link = link_dir / "mcm"
+        os.symlink(os.path.relpath(str(scripts / "main.sh"), str(link_dir)), str(link))
+        env = isolated_env(self.home)
+        help_proc = subprocess.run(
+            [str(link), "help"],
+            cwd=str(self.tmp),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        self.assertEqual(
+            help_proc.returncode,
+            0,
+            help_proc.stdout + help_proc.stderr,
+        )
+
+        registry = self.mcm_home / "registry"
+        registry.mkdir(parents=True, exist_ok=True)
+        (registry / "index.json").write_text(json.dumps({"mcps": []}))
+        status_proc = subprocess.run(
+            [str(link), "status"],
+            cwd=str(self.tmp),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        self.assertEqual(
+            status_proc.returncode,
+            0,
+            status_proc.stdout + status_proc.stderr,
+        )
+
+    def test_main_sh_from_repo_reaches_the_engine(self):
+        """source: review: scripts found the engine only in the installed flat layout"""
+        env = isolated_env(self.home)
+        proc = subprocess.run(
+            ["bash", "src/commands/main.sh", "inspect", "../evil", "--yes"],
+            cwd=str(REPO_ROOT),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        combined = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 1, combined)
+        self.assertIn("not an npm package name", combined)
+        self.assertNotIn("No such file", combined)
+
+    def test_main_sh_missing_engine_reports_the_search(self):
+        """source: review: scripts found the engine only in the installed flat layout"""
+        lone = self.tmp / "no-engine" / "commands"
+        lone.mkdir(parents=True)
+        shutil.copy(str(SRC_DIR / "commands" / "main.sh"), str(lone / "main.sh"))
+        env = isolated_env(self.home)
+        proc = subprocess.run(
+            ["bash", str(lone / "main.sh"), "inspect", "demo", "--yes"],
+            cwd=str(self.tmp),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        combined = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 1, combined)
+        self.assertIn("was not found", combined)
+        self.assertIn("one folder up", combined)
+
+    def test_main_sh_maps_help_flags(self):
+        """source: review: main.sh did not map -h and --help to help"""
+        main = SRC_DIR / "commands" / "main.sh"
+        env = isolated_env(self.home)
+        for flag in ("-h", "--help"):
+            proc = subprocess.run(
+                ["bash", str(main), flag],
+                cwd=str(self.tmp),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            combined = proc.stdout + proc.stderr
+            self.assertEqual(proc.returncode, 0, combined)
+            self.assertIn("Commands:", combined)
 
 
 class ImportTests(unittest.TestCase):
@@ -1260,13 +2023,63 @@ class InspectTests(IsolatedHomeTest):
                     pass
 
     def test_inspect_malformed_line(self):
-        """source: rail: a stdout line that is not JSON-RPC raises InspectError"""
+        """source: a non-JSON stdout line aborted inspect instead of being skipped and counted"""
         engine_mod = load_engine(self.mcm_home)
+        notes = []
+        tools, _tokens = engine_mod.inspect_command(
+            [sys.executable, FAKE, "malformed"], timeout=10, notes=notes
+        )
+        self.assertEqual(len(tools), 2)
+        self.assertEqual(
+            notes,
+            [
+                "the server wrote 1 line(s) to its output that are not JSON-RPC; they were ignored"
+            ],
+        )
+
+    def test_inspect_nonjson_timeout_names_the_count(self):
+        """source: a server that writes only non-JSON lines and never answers timed out without saying those lines were ignored"""
+        engine_mod = load_engine(self.mcm_home)
+        started = time.monotonic()
         with self.assertRaises(engine_mod.InspectError) as ctx:
             engine_mod.inspect_command(
-                [sys.executable, FAKE, "malformed"], timeout=10
+                [sys.executable, FAKE, "nonjson"],
+                timeout=2,
             )
-        self.assertIn("not JSON-RPC", str(ctx.exception))
+        elapsed = time.monotonic() - started
+        message = str(ctx.exception)
+        self.assertLess(elapsed, 6)
+        self.assertIn("did not answer within 2 seconds", message)
+        self.assertTrue(
+            message.endswith(" (1 line(s) of its output were not JSON-RPC)"),
+            message,
+        )
+
+    def test_inspect_cli_prints_nonjson_note(self):
+        """source: mcm inspect did not say how many non-JSON-RPC lines it ignored"""
+        proc, _record = self._run_inspect(
+            ["inspect", "fake-pkg", "--yes", "--", "malformed"]
+        )
+        combined = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 0, combined)
+        note = (
+            "Note: the server wrote 1 line(s) to its output that are not JSON-RPC; they were ignored"
+        )
+        self.assertIn(note, proc.stdout)
+        self.assertGreater(proc.stdout.find(note), proc.stdout.find("schema"))
+
+    def test_inspect_corrupt_index_reports_save_failure(self):
+        """source: mcm inspect printed a traceback when the registry index could not be saved"""
+        registry = self.mcm_home / "registry"
+        registry.mkdir(parents=True)
+        (registry / "index.json").write_text("{not json")
+        proc, _record = self._run_inspect(
+            ["inspect", "fake-pkg", "--yes", "--", "ok"]
+        )
+        combined = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 1, combined)
+        self.assertIn("was inspected but not saved", combined)
+        self.assertNotIn("Traceback", combined)
 
     def test_inspect_tools_list_error(self):
         """source: rail: a tools/list error is reported with the server's message"""
@@ -1283,6 +2096,60 @@ class InspectTests(IsolatedHomeTest):
         message = str(ctx.exception)
         self.assertIn("exit code 3", message)
         self.assertIn("boom", message)
+
+    def test_inspect_strips_hostile_stderr(self):
+        """source: review: a failed inspect printed the server stderr unsanitized"""
+        engine_mod = load_engine(self.mcm_home)
+        with self.assertRaises(engine_mod.InspectError) as ctx:
+            engine_mod.inspect_command(
+                [sys.executable, FAKE, "stderr_controls"], timeout=10
+            )
+        message = str(ctx.exception)
+        self.assertIn("red", message)
+        self.assertIn("red |", message)
+        for ch in message:
+            code = ord(ch)
+            self.assertGreaterEqual(code, 32)
+            self.assertNotEqual(ch, "\u001b")
+            self.assertFalse(0x80 <= code <= 0x9F)
+
+    def test_inspect_ignores_an_answer_with_another_id(self):
+        """source: an answer with another id was accepted as the tools list"""
+        engine_mod = load_engine(self.mcm_home)
+        try:
+            ok_tools, _ok_tokens = engine_mod.inspect_command(
+                [sys.executable, FAKE, "ok"], timeout=10
+            )
+        except Exception as exc:
+            self.fail("ok mode inspect raised: %s" % exc)
+        try:
+            tools, _tokens = engine_mod.inspect_command(
+                [sys.executable, FAKE, "stale_id"], timeout=10
+            )
+        except Exception as exc:
+            self.fail("an answer with another id aborted inspect: %s" % exc)
+        names = [tool["name"] for tool in tools]
+        ok_names = [tool["name"] for tool in ok_tools]
+        self.assertEqual(names, ok_names)
+        self.assertNotIn("wrong_tool", names)
+
+    def test_inspect_skips_request_with_the_awaited_id(self):
+        """source: review: a server-sent request whose id equals the awaited id was taken as the answer"""
+        engine_mod = load_engine(self.mcm_home)
+        try:
+            ok_tools, _ok_tokens = engine_mod.inspect_command(
+                [sys.executable, FAKE, "ok"], timeout=10
+            )
+        except Exception as exc:
+            self.fail("ok mode inspect raised: %s" % exc)
+        try:
+            tools, _tokens = engine_mod.inspect_command(
+                [sys.executable, FAKE, "same_id"], timeout=10
+            )
+        except engine_mod.InspectError as exc:
+            self.fail("a server request was taken as the answer: %s" % exc)
+        self.assertEqual(len(tools), len(ok_tools))
+        self.assertEqual(tools[0]["name"], "read_file")
 
     def test_inspect_env_is_minimal_and_folder_removed(self):
         """source: rail: the server receives only PATH, HOME, USER, LANG and TMPDIR, and its folder is removed"""
@@ -1584,6 +2451,110 @@ class InspectTests(IsolatedHomeTest):
         entry = [item for item in index["mcps"] if item["name"] == "demo-mcp"][0]
         self.assertTrue(entry["inspected"])
         self.assertEqual(entry["tool_count"], 2)
+
+
+class RegistryIndexTests(IsolatedHomeTest):
+    def _metadata(self, engine_mod, name="demo-mcp"):
+        return engine_mod.MCPMetadata(
+            name=name,
+            source="npm",
+            url="https://www.npmjs.com/package/" + name,
+            description="",
+            tools=[],
+            tool_count=0,
+            complexity_score=0.0,
+            context_cost_estimate=0,
+            dependencies=[],
+            credentials_needed=[],
+            discovered_at="2020-01-01T00:00:00Z",
+            format="direct",
+        )
+
+    def test_corrupt_index_is_reported_without_traceback(self):
+        """source: review: a corrupt registry index raised a traceback in status and validate"""
+        engine_mod = load_engine(self.mcm_home)
+        engine = engine_mod.MCMEngine()
+        index_path = self.mcm_home / "registry" / "index.json"
+        index_path.write_text("{not json")
+        with self.assertRaises(ValueError) as ctx:
+            engine.save_metadata(self._metadata(engine_mod))
+        self.assertEqual(
+            str(ctx.exception),
+            "the registry index is not valid JSON: %s" % index_path,
+        )
+
+        env = isolated_env(self.home)
+        expected = (
+            "The registry index is not valid JSON: %s. Move it aside and run discover again."
+            % index_path
+        )
+        for script in ("status.sh", "validate.sh"):
+            proc = subprocess.run(
+                ["bash", str(SRC_DIR / "commands" / script)],
+                cwd=str(self.tmp),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            combined = proc.stdout + proc.stderr
+            self.assertEqual(proc.returncode, 1, combined)
+            self.assertIn(expected, combined)
+            self.assertIn("is not valid JSON", combined)
+            self.assertNotIn("Traceback", combined)
+
+    def test_index_without_mcps_is_accepted(self):
+        """source: review: an index without mcps was not accepted"""
+        engine_mod = load_engine(self.mcm_home)
+        engine = engine_mod.MCMEngine()
+        index_path = self.mcm_home / "registry" / "index.json"
+        index_path.parent.mkdir(parents=True, exist_ok=True)
+        index_path.write_text("{}")
+        engine.save_metadata(self._metadata(engine_mod))
+        saved = json.loads(index_path.read_text())
+        self.assertEqual([item["name"] for item in saved["mcps"]], ["demo-mcp"])
+
+    def test_save_metadata_leaves_no_temp_file(self):
+        """source: review: the registry index was rewritten in place"""
+        engine_mod = load_engine(self.mcm_home)
+        engine = engine_mod.MCMEngine()
+        engine.save_metadata(self._metadata(engine_mod))
+        registry = self.mcm_home / "registry"
+        files = sorted(
+            path.relative_to(registry).as_posix()
+            for path in registry.rglob("*")
+            if path.is_file()
+        )
+        self.assertEqual(files, ["demo-mcp/metadata.json", "index.json"])
+        parsed = json.loads((registry / "index.json").read_text())
+        self.assertEqual(parsed["mcps"][0]["name"], "demo-mcp")
+
+    def test_failed_index_write_keeps_the_old_index_and_no_temp_file(self):
+        """source: a failed registry index write replaced the old index or left a temp file"""
+        engine_mod = load_engine(self.mcm_home)
+        engine = engine_mod.MCMEngine()
+        engine.save_metadata(self._metadata(engine_mod, "kept-mcp"))
+        index_path = self.mcm_home / "registry" / "index.json"
+        recorded = index_path.read_bytes()
+        real_dump = engine_mod.json.dump
+
+        def failing_dump(payload, handle, *args, **kwargs):
+            if isinstance(payload, dict) and "mcps" in payload:
+                handle.write("{")
+                raise OSError("disk full")
+            return real_dump(payload, handle, *args, **kwargs)
+
+        with patch.object(engine_mod.json, "dump", failing_dump):
+            with self.assertRaises(OSError):
+                engine.save_metadata(self._metadata(engine_mod, "other-mcp"))
+        self.assertEqual(index_path.read_bytes(), recorded)
+        registry = self.mcm_home / "registry"
+        leftover = []
+        for dirpath, _dirnames, filenames in os.walk(str(registry)):
+            for name in filenames:
+                if name.startswith(".mcm-tmp-"):
+                    leftover.append(os.path.join(dirpath, name))
+        self.assertEqual(leftover, [])
 
 
 if __name__ == "__main__":

@@ -86,44 +86,19 @@ else
     echo -e "${YELLOW}⚠ Config already exists (skipped)${NC}"
 fi
 
-# Create credentials template
-if [[ ! -f "$MCM_HOME/config/credentials.env" ]]; then
-    cat > "$MCM_HOME/config/credentials.env" <<'EOF'
-# MCP Context Manager - Credentials
-# Fill in your API keys below
-
-# GitHub (for GitHub MCP)
-# Get token from: https://github.com/settings/tokens
-# Needs scopes: repo, read:org
-GITHUB_TOKEN=
-
-# Add other MCP-specific credentials as needed
-# Format: KEY=value (no spaces around =)
-
-EOF
-    echo -e "${GREEN}✓ Created credentials template${NC}"
-else
-    echo -e "${YELLOW}⚠ Credentials file already exists (skipped)${NC}"
-fi
-
 # Create example MCP list
 cat > "$MCM_HOME/cache/mcp-list-example.txt" <<'EOF'
-# Example MCP List
-# You can paste this format when running /mcm discover
-
-# Simple names
-filesystem
-github
-postgres
+# Example MCP list
+# Paste lines like these when you run /mcm discover.
+# Use full npm package names. A plain name is looked up on npm exactly as written.
 
 # npm packages
-@modelcontextprotocol/server-slack
-@modelcontextprotocol/server-playwright
+@modelcontextprotocol/server-filesystem
+@modelcontextprotocol/server-memory
+@playwright/mcp
 
-# GitHub URLs
+# GitHub repository URLs
 https://github.com/modelcontextprotocol/servers
-
-# Mixed formats work too!
 EOF
 
 echo ""
@@ -135,9 +110,8 @@ echo -e "${BOLD}Next steps:${NC}"
 echo ""
 echo "1. In Claude Code, type: ${CYAN}/mcm discover${NC}"
 echo "2. Paste your MCP list (see example: $MCM_HOME/cache/mcp-list-example.txt)"
-echo "3. Wait for discovery to complete (2-5 minutes)"
-echo "4. Add credentials if needed: ${CYAN}code $MCM_HOME/config/credentials.env${NC}"
-echo "5. Validate: ${CYAN}/mcm validate${NC}"
+echo "3. Wait for discovery to finish (a few seconds per name)"
+echo "4. Validate: ${CYAN}/mcm validate${NC}"
 echo ""
 echo "For help: ${CYAN}/mcm help${NC} (in Claude Code)"
 echo ""

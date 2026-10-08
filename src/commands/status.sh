@@ -19,8 +19,16 @@ if [[ -f "$MCM_HOME/registry/index.json" ]]; then
 import json
 import sys
 
-with open(sys.argv[1]) as handle:
-    data = json.load(handle)
+path = sys.argv[1]
+try:
+    with open(path) as handle:
+        data = json.load(handle)
+except json.JSONDecodeError:
+    print(
+        "The registry index is not valid JSON: %s. Move it aside and run discover again."
+        % path
+    )
+    sys.exit(1)
 
 mcps = data.get("mcps", [])
 print("Discovered MCPs: %d" % len(mcps))
@@ -49,6 +57,9 @@ else:
         % (inspected, len(mcps), tool_total, token_total)
     )
 PY
+    if [[ $? -ne 0 ]]; then
+        exit 1
+    fi
 else
     echo "No MCPs discovered yet."
     echo "Run 'mcm discover' to get started."

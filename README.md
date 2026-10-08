@@ -9,7 +9,7 @@
 
 ## 🎯 The Problem
 
-Model Context Protocol (MCP) servers extend Claude Code with powerful tools — but as the MCP ecosystem grows, **users lose visibility and control**.
+Model Context Protocol (MCP) servers extend Claude Code with powerful tools, but as the MCP ecosystem grows, **users lose visibility and control**.
 
 Once you enable multiple MCPs, it becomes difficult to answer basic questions:
 
@@ -62,7 +62,7 @@ MCM is an **inspection and organization layer**, not a runtime optimizer.
 
 * MCPs are **discovered and indexed**, not loaded as tools
 * Tool schemas are summarized and stored locally
-* You can search, review, and compare MCP capabilities
+* `status` and `validate` list what was saved, so you can review servers side by side
 * Large MCP definitions don’t need to live in your prompt history
 
 Think of MCM as an **MCP audit and exploration toolkit**.
@@ -104,8 +104,9 @@ In **Claude Code**, type:
 /mcm discover
 ```
 
-Paste MCP names, packages, or URLs (any format).
-MCM will analyze them and store results locally.
+Paste npm package names or GitHub repository URLs, one per line. MCM looks each one up and stores the details locally.
+
+Use the full package name, for example `@modelcontextprotocol/server-filesystem`. A plain name is looked up on npm exactly as written.
 
 From a terminal:
 
@@ -124,6 +125,7 @@ Results land in `~/.mcm/registry/index.json`. `bash ~/.claude/scripts/mcm/main.s
 - It saves tool names, descriptions cut to 200 characters and schema sizes.
 - Status and validate show real counts only for inspected servers and "not inspected" for the rest.
 - The token figure is the tool definitions' characters divided by 4.
+- A line of server output that is not JSON-RPC is ignored and counted, and inspect tells you how many there were.
 - If a first run times out while npx is still downloading the package, run it again.
 
 ```bash
@@ -149,6 +151,7 @@ This moves MCP reasoning from **prompt-time → offline-time**.
 * discover sends each name you give it to registry.npmjs.org. For a package whose repository is on GitHub, it sends the owner/repo to api.github.com (with GITHUB_TOKEN if you set it) and reads the repository's package.json from raw.githubusercontent.com.
 * inspect sends nothing to MCM's lookups, and npx downloads the package from the npm registry.
 * MCM uses no search service. The only key it reads is GITHUB_TOKEN, and only for api.github.com.
+* Set GITHUB_TOKEN in your shell to raise GitHub's rate limit; MCM reads it from the environment and stores it nowhere.
 * Nothing else leaves your machine: no file contents, no paths and no config. Each request is printed as it happens.
 * A name must look like an npm package, a GitHub repository URL or a plain name; anything else is skipped and nothing is sent for it.
 * A redirect to another host is refused, so a token or key never follows one.
@@ -195,7 +198,7 @@ python3 -m unittest discover -s tests -v
 
 ## 📄 License
 
-MIT License — see [LICENSE](LICENSE) for details.
+MIT License. See [LICENSE](LICENSE) for details.
 
 
 
