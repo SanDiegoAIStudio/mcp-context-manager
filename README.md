@@ -222,6 +222,18 @@ python3 -m unittest discover -s tests -v
 
 ---
 
+## The story (then and now)
+
+**Then.** On Saturday, November 15, 2025, I asked Claude Code: "which are the best MCP's for me?" I had Playwright hooked up and didn't know what else to add. A couple of hours later I pasted in Anthropic's new post, "Code execution with MCP" (published November 4), with one line of my own: "trying to learn the best way to solve this prob." The problem: every server you add loads all of its tool definitions into the context window before you type a word. I was on Claude Code 2.0.41 with Sonnet 4.5, and I had no tool I trusted to show me what a server would cost before I turned it on.
+
+The first commit landed at 12:04. At 14:13 I typed `/mcm discover`, and at 14:18 I wrote "lets do a git save and push to github, the MCM app since it is working." It was the busiest day in my November 8 to December 11 logs: 20 sessions, 1,924 tool calls.
+
+It also promised too much. The setup guide said MCM would "save 90-95%" of context. Nothing measured that. The cost estimate was a fixed number.
+
+**Now.** Claude Code shows per-server context cost on its own these days, and other tools scan servers. One thing is still missing: a local look before you install, with nothing sent anywhere. So the re-release does one honest job. `mcm inspect` starts a server in a throwaway folder, asks for its real tools and counts the tokens. The filesystem server came back with 14 tools, about 3,274 tokens, in 3.6 seconds. 114 tests pass, and the README now says what it doesn't do.
+
+State: experimental. I don't run it daily. Next up: pin a server's tools and flag when they change.
+
 ## 📄 License
 
 MIT License. See [LICENSE](LICENSE) for details.
